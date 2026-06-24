@@ -5,26 +5,56 @@ import CoreAudio
 // MARK: - Headphone Model
 struct HeadphoneModel {
     let name: String
+    let outputDeviceNames: [String]
     let sensitivityDBV: Float
     let impedance: Float
+    let maxOutputVRMS: Float
+    let isEstimatedProfile: Bool
 }
 
-let chu2 = HeadphoneModel(name: "水月雨 竹 2", sensitivityDBV: 117, impedance: 28)
+private let playbackProfiles: [HeadphoneModel] = [
+    HeadphoneModel(
+        name: "AirPods Pro 3",
+        outputDeviceNames: ["airpods pro", "airpods", "airpods pro 3"],
+        sensitivityDBV: 105,
+        impedance: 32,
+        maxOutputVRMS: 1.0,
+        isEstimatedProfile: true
+    ),
+    HeadphoneModel(
+        name: "Mac 普通扬声器",
+        outputDeviceNames: ["macbook", "mac", "built-in", "internal speakers", "内建", "内置", "扬声器", "speakers"],
+        sensitivityDBV: 84,
+        impedance: 8,
+        maxOutputVRMS: 1.0,
+        isEstimatedProfile: true
+    ),
+    HeadphoneModel(
+        name: "水月雨 竹 2",
+        outputDeviceNames: ["chu", "chu ii", "chu 2", "水月雨", "竹", "moondrop", "headphones", "external headphones", "外置耳机", "耳机"],
+        sensitivityDBV: 119,
+        impedance: 18,
+        maxOutputVRMS: 1.0,
+        isEstimatedProfile: false
+    )
+]
+
+private let fallbackProfile = playbackProfiles[1]
 
 // MARK: - Volume Estimation
 let macMaxOutputVRMS: Float = 1.0
 let maxAttenuation: Float = 65
 let curveExponent: Float = 1.6
 
-func volumeToVoltage(_ volume: Float) -> Float {
+func volumeToVoltage(_ volume: Float, maxOutputVRMS: Float = macMaxOutputVRMS) -> Float {
     guard volume > 0 else { return 0 }
-    return macMaxOutputVRMS * pow(10, -maxAttenuation * pow(1 - volume/100, curveExponent) / 20.0)
+    return maxOutputVRMS * pow(10, -maxAttenuation * pow(1 - volume/100, curveExponent) / 20.0)
 }
 
-func estimateDBSPL(volume: Float) -> (dbSPL: Float, attenuationDB: Float) {
-    let v = volumeToVoltage(volume)
-    let attenDB: Float = volume > 0 ? 20 * log10(v / macMaxOutputVRMS) : -.infinity
-    return (chu2.sensitivityDBV + attenDB, attenDB)
+func estimateDBSPL(volume: Float, model: HeadphoneModel) -> (dbSPL: Float, attenuationDB: Float) {
+    let v = volumeToVoltage(volume, maxOutputVRMS: model.maxOutputVRMS)
+    let attenDB: Float = volume > 0 ? 20 * log10(v / model.maxOutputVRMS) : -.infinity
+    return (model.sensitivityDBV + attenDB, attenDB)
 }
 
 func safetyInfo(_ db: Float) -> (label: String, emoji: String, color: NSColor) {
@@ -73,8 +103,19 @@ class PopoverViewController: NSViewController {
     private var scaleLabels: [NSTextField] = []
 
     private var currentVolume: Float = 0
+    private var displayedVolume: Float = 0
+    private var displayedRMSDBFS: Float = -96
+    private var displayedPeakDBFS: Float = -96
+    private var displayedAudioFraction: Float = 0
+    private var displayedDBSPL: Float?
     private var currentDBSPL: Float?
     private var lastVolumePoll = Date.distantPast
+    private var lastDisplayRefresh = Date()
+    private var lastTextRefresh = Date.distantPast
+    private var activeProfile = fallbackProfile
+
+    private(set) var statusBarLevelText = "--"
+    private(set) var statusBarLevelColor = NSColor.systemGray
 
     init(audioMonitor: SystemAudioLevelMonitor) {
         self.audioMonitor = audioMonitor
@@ -148,17 +189,17 @@ class PopoverViewController: NSViewController {
         volumeBar = makeBar(color: NSColor(red: 0.38, green: 0.72, blue: 1.0, alpha: 0.8), radius: 4)
         volumeBarContainer.addSubview(volumeBar)
 
-        maxSPLLabel = makeLabel("满刻度估算 -- dB SPL", size: 10, weight: .regular, color: NSColor(white: 0.52, alpha: 1))
+        maxSPLLabel = makeLabel("满刻度估算 -- dBA", size: 10, weight: .regular, color: NSColor(white: 0.52, alpha: 1))
         root.addSubview(maxSPLLabel)
 
-        dbTitleLabel = makeLabel("实时估算声压", size: 11, weight: .medium, color: NSColor(white: 0.72, alpha: 1))
+        dbTitleLabel = makeLabel("实时估算声压(A)", size: 11, weight: .medium, color: NSColor(white: 0.72, alpha: 1))
         root.addSubview(dbTitleLabel)
 
         dbSPLLabel = makeLabel("—", size: 39, weight: .bold, color: .white)
         dbSPLLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 39, weight: .bold)
         root.addSubview(dbSPLLabel)
 
-        dbUnitLabel = makeLabel("dB SPL", size: 12, weight: .medium, color: NSColor(white: 0.55, alpha: 1))
+        dbUnitLabel = makeLabel("dBA", size: 12, weight: .medium, color: NSColor(white: 0.55, alpha: 1))
         root.addSubview(dbUnitLabel)
 
         audioBarContainer = makeBarContainer(heightRadius: 6)
@@ -167,7 +208,7 @@ class PopoverViewController: NSViewController {
         audioBar = makeBar(color: NSColor.systemGreen.withAlphaComponent(0.78), radius: 5)
         audioBarContainer.addSubview(audioBar)
 
-        rmsLabel = makeLabel("RMS -- dBFS", size: 10, weight: .regular, color: NSColor(white: 0.5, alpha: 1))
+        rmsLabel = makeLabel("RMS(A) -- dBFS", size: 10, weight: .regular, color: NSColor(white: 0.5, alpha: 1))
         root.addSubview(rmsLabel)
 
         peakLabel = makeLabel("Peak -- dBFS", size: 10, weight: .regular, color: NSColor(white: 0.5, alpha: 1))
@@ -188,7 +229,7 @@ class PopoverViewController: NSViewController {
         separatorLine.layer?.backgroundColor = NSColor(white: 0.32, alpha: 0.25).cgColor
         root.addSubview(separatorLine)
 
-        hpInfoLabel = makeLabel("🎯 \(chu2.name) · 117 dB/V · 28 Ω", size: 10, weight: .regular, color: NSColor(white: 0.48, alpha: 1))
+        hpInfoLabel = makeLabel("🎯 \(profileDescription(activeProfile))", size: 10, weight: .regular, color: NSColor(white: 0.48, alpha: 1))
         root.addSubview(hpInfoLabel)
 
         buildScale()
@@ -218,7 +259,7 @@ class PopoverViewController: NSViewController {
         currentMarker = makeMarker(color: .white)
         scaleContainer.addSubview(currentMarker)
 
-        for text in ["50", "70", "85", "100", "117 dB"] {
+        for text in ["50", "70", "85", "100", "117 dBA"] {
             let label = makeLabel(text, size: 8, weight: .regular, color: NSColor(white: 0.52, alpha: 1))
             label.alignment = .center
             scaleContainer.addSubview(label)
@@ -283,12 +324,14 @@ class PopoverViewController: NSViewController {
         loadViewIfNeeded()
 
         refreshSystemVolume()
-        let maxSPL = estimateDBSPL(volume: currentVolume).dbSPL
+        let maxSPL = estimateDBSPL(volume: currentVolume, model: activeProfile).dbSPL
         let snapshot = audioMonitor.snapshot()
+        updateSmoothedDisplay(snapshot: snapshot, maxSPL: maxSPL)
 
-        volumeNumberLabel.stringValue = "\(Int(currentVolume.rounded()))"
+        volumeNumberLabel.stringValue = "\(Int(displayedVolume.rounded()))"
+        hpInfoLabel.stringValue = "🎯 \(profileDescription(activeProfile))"
         if maxSPL.isFinite {
-            maxSPLLabel.stringValue = String(format: "满刻度估算 %.1f dB SPL", maxSPL)
+            maxSPLLabel.stringValue = String(format: "满刻度估算 %.1f dBA", maxSPL)
         } else {
             maxSPLLabel.stringValue = "系统静音"
         }
@@ -308,23 +351,76 @@ class PopoverViewController: NSViewController {
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &sz, &deviceID) == noErr,
               deviceID != kAudioObjectUnknown else { return }
 
-        var volAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        if AudioObjectHasProperty(deviceID, &volAddr) {
-            var vol: Float32 = 0
-            var vsz = UInt32(MemoryLayout<Float32>.size)
-            if AudioObjectGetPropertyData(deviceID, &volAddr, 0, nil, &vsz, &vol) == noErr {
-                currentVolume = max(0, min(1, vol)) * 100
-            }
+        if let deviceName = readOutputDeviceName(deviceID: deviceID) {
+            activeProfile = profile(for: deviceName)
+        }
+
+        if let volume = readOutputVolume(deviceID: deviceID, element: kAudioObjectPropertyElementMain) {
+            currentVolume = volume * 100
+            return
+        }
+
+        let channels = [
+            readOutputVolume(deviceID: deviceID, element: 1),
+            readOutputVolume(deviceID: deviceID, element: 2)
+        ].compactMap { $0 }
+
+        if !channels.isEmpty {
+            currentVolume = (channels.reduce(0, +) / Float(channels.count)) * 100
         }
     }
 
+    private func readOutputVolume(deviceID: AudioObjectID, element: AudioObjectPropertyElement) -> Float? {
+        var volAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+
+        guard AudioObjectHasProperty(deviceID, &volAddr) else { return nil }
+
+        var volume: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &volAddr, 0, nil, &size, &volume) == noErr else {
+            return nil
+        }
+
+        return max(0, min(1, volume))
+    }
+
+    private func readOutputDeviceName(deviceID: AudioObjectID) -> String? {
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        guard AudioObjectHasProperty(deviceID, &nameAddr) else { return nil }
+
+        var deviceName: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let result = withUnsafeMutablePointer(to: &deviceName) { pointer in
+            AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &size, pointer)
+        }
+
+        guard result == noErr else { return nil }
+        return deviceName as String
+    }
+
+    private func profile(for deviceName: String) -> HeadphoneModel {
+        let normalizedName = deviceName.lowercased()
+        if let profile = playbackProfiles.first(where: { model in
+            model.outputDeviceNames.contains(where: { normalizedName.contains($0.lowercased()) })
+        }) {
+            return profile
+        }
+
+        return fallbackProfile
+    }
+
     private func updateAudioState(snapshot: AudioLevelSnapshot, maxSPL: Float) {
-        rmsLabel.stringValue = formatDBFS("RMS", snapshot.rmsDBFS)
-        peakLabel.stringValue = formatDBFS("Peak", snapshot.peakDBFS)
+        rmsLabel.stringValue = formatDBFS("RMS(A)", displayedRMSDBFS)
+        peakLabel.stringValue = formatDBFS("Peak", displayedPeakDBFS)
 
         guard currentVolume > 0 else {
             currentDBSPL = nil
@@ -334,11 +430,15 @@ class PopoverViewController: NSViewController {
 
         switch snapshot.status {
         case .capturing where snapshot.hasUsableAudio && maxSPL.isFinite:
-            let spl = max(0, maxSPL + snapshot.rmsDBFS)
+            let spl = displayedDBSPL ?? max(0, maxSPL + snapshot.rmsDBFS)
             currentDBSPL = spl
-            dbSPLLabel.stringValue = String(format: "%.1f", spl)
+            if shouldRefreshText() {
+                dbSPLLabel.stringValue = String(format: "%.1f", spl)
+            }
 
             let safety = safetyInfo(spl)
+            statusBarLevelText = "\(Int(spl.rounded()))"
+            statusBarLevelColor = safety.color
             safetyEmojiLabel.stringValue = safety.emoji
             safetyLabel.stringValue = safety.label
             safetyLabel.textColor = safety.color
@@ -350,7 +450,7 @@ class PopoverViewController: NSViewController {
 
         case .noPermission:
             currentDBSPL = nil
-            setInactiveState(title: "需要屏幕录制权限", detail: "设置 → 隐私与安全性 → 屏幕录制 → 勾选 VolumeMonitor", color: NSColor.systemOrange)
+            setInactiveState(title: "需要系统音频权限", detail: "授权一次后即可持续读取系统音频", color: NSColor.systemOrange)
 
         case .failed(let message):
             currentDBSPL = nil
@@ -358,7 +458,7 @@ class PopoverViewController: NSViewController {
 
         case .starting:
             currentDBSPL = nil
-            setInactiveState(title: "请求权限中", detail: "请在弹出的对话框中选择允许", color: NSColor.systemBlue)
+            setInactiveState(title: "启动采集中", detail: "正在连接系统音频 tap", color: NSColor.systemBlue)
 
         default:
             currentDBSPL = nil
@@ -367,6 +467,8 @@ class PopoverViewController: NSViewController {
     }
 
     private func setInactiveState(title: String, detail: String, color: NSColor) {
+        statusBarLevelText = "--"
+        statusBarLevelColor = color
         dbSPLLabel.stringValue = "—"
         safetyEmojiLabel.stringValue = "◌"
         safetyLabel.stringValue = title
@@ -378,11 +480,97 @@ class PopoverViewController: NSViewController {
         scaleFill.layer?.backgroundColor = color.withAlphaComponent(0.55).cgColor
     }
 
+    private func updateSmoothedDisplay(snapshot: AudioLevelSnapshot, maxSPL: Float) {
+        let now = Date()
+        let dt = min(max(Float(now.timeIntervalSince(lastDisplayRefresh)), 1.0 / 120.0), 0.25)
+        lastDisplayRefresh = now
+
+        displayedVolume = smooth(
+            current: displayedVolume,
+            target: currentVolume,
+            dt: dt,
+            attackTime: 0.12,
+            releaseTime: 0.18
+        )
+
+        guard snapshot.hasUsableAudio, currentVolume > 0, maxSPL.isFinite else {
+            displayedRMSDBFS = smooth(
+                current: displayedRMSDBFS,
+                target: -96,
+                dt: dt,
+                attackTime: 0.45,
+                releaseTime: 0.45
+            )
+            displayedPeakDBFS = smooth(
+                current: displayedPeakDBFS,
+                target: -96,
+                dt: dt,
+                attackTime: 0.7,
+                releaseTime: 0.7
+            )
+            displayedAudioFraction = smooth(
+                current: displayedAudioFraction,
+                target: 0,
+                dt: dt,
+                attackTime: 0.45,
+                releaseTime: 0.45
+            )
+            displayedDBSPL = nil
+            return
+        }
+
+        displayedRMSDBFS = smooth(
+            current: displayedRMSDBFS,
+            target: snapshot.rmsDBFS,
+            dt: dt,
+            attackTime: 0.16,
+            releaseTime: 0.85
+        )
+        displayedPeakDBFS = smooth(
+            current: displayedPeakDBFS,
+            target: snapshot.peakDBFS,
+            dt: dt,
+            attackTime: 0.08,
+            releaseTime: 1.1
+        )
+
+        let targetSPL = max(0, maxSPL + snapshot.rmsDBFS)
+        displayedDBSPL = smooth(
+            current: displayedDBSPL ?? targetSPL,
+            target: targetSPL,
+            dt: dt,
+            attackTime: 0.2,
+            releaseTime: 1.0
+        )
+
+        let targetAudioFraction = max(0.04, min(1, (displayedRMSDBFS + 60) / 60))
+        displayedAudioFraction = smooth(
+            current: displayedAudioFraction,
+            target: targetAudioFraction,
+            dt: dt,
+            attackTime: 0.18,
+            releaseTime: 0.9
+        )
+    }
+
+    private func smooth(current: Float, target: Float, dt: Float, attackTime: Float, releaseTime: Float) -> Float {
+        let time = target > current ? attackTime : releaseTime
+        let alpha = 1 - exp(-dt / max(time, 0.001))
+        return current + (target - current) * alpha
+    }
+
+    private func shouldRefreshText() -> Bool {
+        let now = Date()
+        guard now.timeIntervalSince(lastTextRefresh) >= 0.12 else { return false }
+        lastTextRefresh = now
+        return true
+    }
+
     private func updateBars(animated: Bool) {
         guard volumeBarContainer.bounds.width > 0, audioBarContainer.bounds.width > 0 else { return }
 
-        let volumeFraction = CGFloat(max(0, min(100, currentVolume)) / 100)
-        let audioFraction = CGFloat(audioFillFraction())
+        let volumeFraction = CGFloat(max(0, min(100, displayedVolume)) / 100)
+        let audioFraction = CGFloat(displayedAudioFraction)
 
         let volumeWidth = max(4, (volumeBarContainer.bounds.width - 2) * volumeFraction)
         let audioWidth = max(4, (audioBarContainer.bounds.width - 2) * audioFraction)
@@ -403,19 +591,13 @@ class PopoverViewController: NSViewController {
 
         if animated {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.08
+                context.duration = 0.12
                 context.allowsImplicitAnimation = true
                 updates()
             }
         } else {
             updates()
         }
-    }
-
-    private func audioFillFraction() -> Float {
-        let snapshot = audioMonitor.snapshot()
-        guard snapshot.hasUsableAudio else { return 0 }
-        return max(0.04, min(1, (snapshot.rmsDBFS + 60) / 60))
     }
 
     private func scaleFillWidth() -> CGFloat {
@@ -459,6 +641,17 @@ class PopoverViewController: NSViewController {
             green: min(1, rgb.greenComponent * 0.7 + 0.22),
             blue: min(1, rgb.blueComponent * 0.7 + 0.22),
             alpha: 0.78
+        )
+    }
+
+    private func profileDescription(_ profile: HeadphoneModel) -> String {
+        let marker = profile.isEstimatedProfile ? "估算" : "标称"
+        return String(
+            format: "%@ · %.0f dB/V · %.0f Ω · %@",
+            profile.name,
+            profile.sensitivityDBV,
+            profile.impedance,
+            marker
         )
     }
 

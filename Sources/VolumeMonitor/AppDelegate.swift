@@ -8,6 +8,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var popoverVC: PopoverViewController!
     private let audioMonitor = SystemAudioLevelMonitor()
     private var timer: Timer?
+    private var lastStatusBarText = ""
+    private var lastStatusBarColorKey = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installStatusItem()
@@ -19,12 +21,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover.animates = true
 
         refreshData()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshData()
             }
         }
-        timer?.tolerance = 0.01
+        timer?.tolerance = 0.004
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -46,6 +48,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refreshData() {
         popoverVC.refreshVolume()
+        updateStatusBarIcon()
     }
 
     private func installStatusItem() {
@@ -55,30 +58,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            button.image = createStatusBarIcon()
+            button.image = createStatusBarIcon(text: "--", color: .systemGray)
             button.action = #selector(togglePopover)
             button.target = self
         }
     }
 
-    private func createStatusBarIcon() -> NSImage {
-        let size = NSSize(width: 22, height: 18)
+    private func updateStatusBarIcon() {
+        let text = popoverVC.statusBarLevelText
+        let color = popoverVC.statusBarLevelColor
+        let colorKey = statusBarColorKey(color)
+
+        guard text != lastStatusBarText || colorKey != lastStatusBarColorKey else { return }
+        lastStatusBarText = text
+        lastStatusBarColorKey = colorKey
+
+        statusItem.length = 44
+        statusItem.button?.image = createStatusBarIcon(text: text, color: color)
+        statusItem.button?.toolTip = text == "--" ? "实时估算声压：无音频" : "实时估算声压：\(text) dBA"
+    }
+
+    private func createStatusBarIcon(text: String, color: NSColor) -> NSImage {
+        let size = NSSize(width: 40, height: 18)
         let image = NSImage(size: size)
         image.lockFocus()
 
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold),
             .foregroundColor: NSColor.white
         ]
-        let text = "dB"
-        text.draw(at: NSPoint(x: 2, y: 1), withAttributes: attributes)
+        let textSize = text.size(withAttributes: attributes)
+        let textX = max(1, 31 - textSize.width)
+        text.draw(at: NSPoint(x: textX, y: 0), withAttributes: attributes)
 
-        let dotRect = NSRect(x: 17, y: 4, width: 4, height: 4)
-        NSColor.systemGreen.setFill()
+        let dotRect = NSRect(x: 34, y: 6, width: 5, height: 5)
+        color.setFill()
         NSBezierPath(ovalIn: dotRect).fill()
 
         image.unlockFocus()
         image.isTemplate = false
         return image
+    }
+
+    private func statusBarColorKey(_ color: NSColor) -> String {
+        let rgb = color.usingColorSpace(.deviceRGB) ?? color
+        return String(format: "%.2f-%.2f-%.2f-%.2f", rgb.redComponent, rgb.greenComponent, rgb.blueComponent, rgb.alphaComponent)
     }
 }

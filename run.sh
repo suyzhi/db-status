@@ -9,10 +9,44 @@ SIGNING_PASSWORD="volume-monitor"
 SIGNING_DIR="$PWD/build/codesign"
 SIGNING_KEYCHAIN="$SIGNING_DIR/VolumeMonitor.keychain-db"
 
+ensure_keychain_search_list() {
+  local keychain
+  local trimmed
+  local exists=0
+  local keychains=()
+
+  while IFS= read -r keychain; do
+    trimmed="${keychain#*\"}"
+    trimmed="${trimmed%\"}"
+    [ -n "$trimmed" ] || continue
+    if [ "$trimmed" = "$SIGNING_KEYCHAIN" ]; then
+      exists=1
+    fi
+    keychains+=("$trimmed")
+  done < <(security list-keychains -d user)
+
+  if [ "$exists" -eq 0 ]; then
+    security list-keychains -d user -s "$SIGNING_KEYCHAIN" "${keychains[@]}"
+  fi
+}
+
+prepare_signing_keychain() {
+  security unlock-keychain -p "$SIGNING_PASSWORD" "$SIGNING_KEYCHAIN" >/dev/null
+  security set-keychain-settings -lut 21600 "$SIGNING_KEYCHAIN" >/dev/null
+  security set-key-partition-list \
+    -S apple-tool:,apple:,codesign: \
+    -s \
+    -k "$SIGNING_PASSWORD" \
+    "$SIGNING_KEYCHAIN" >/dev/null 2>&1
+  ensure_keychain_search_list
+}
+
 ensure_signing_identity() {
   mkdir -p "$SIGNING_DIR"
 
-  if security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" 2>/dev/null | grep -q "$SIGNING_NAME"; then
+  identity_output="$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" 2>/dev/null || true)"
+  if echo "$identity_output" | grep -q "\"$SIGNING_NAME\"" && echo "$identity_output" | grep -q "1 valid identities found"; then
+    prepare_signing_keychain
     return
   fi
 
@@ -62,6 +96,7 @@ EOF
     -p codeSign \
     -k "$SIGNING_KEYCHAIN" \
     "$SIGNING_DIR/VolumeMonitorLocal.crt" >/dev/null
+  prepare_signing_keychain
 }
 
 echo "🔨 Building..."
@@ -87,19 +122,30 @@ if [ ! -f "$hash_file" ] || [ "$(cat "$hash_file")" != "$source_hash" ]; then
   needs_sign=1
 fi
 
+if [ -f "$SIGNING_KEYCHAIN" ]; then
+  prepare_signing_keychain
+fi
+
 if ! codesign --verify build/VolumeMonitor.app 2>/dev/null; then
   needs_sign=1
 fi
 
-if ! codesign -d -vvv build/VolumeMonitor.app 2>&1 | grep -q "Authority=$SIGNING_NAME"; then
+signature_details="$(codesign -d -vvv build/VolumeMonitor.app 2>&1 || true)"
+if [[ "$signature_details" != *"Authority=$SIGNING_NAME"* ]]; then
   needs_sign=1
 fi
 
 if [ "$needs_sign" -eq 1 ]; then
   ensure_signing_identity
   echo "🔑 Re-signing..."
-  codesign --force --sign "$SIGNING_NAME" --keychain "$SIGNING_KEYCHAIN" build/VolumeMonitor.app
-  if ! codesign -d -vvv build/VolumeMonitor.app 2>&1 | grep -q "Authority=$SIGNING_NAME"; then
+  signing_identity="$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" | awk -v name="$SIGNING_NAME" '$0 ~ name {print $2; exit}')"
+  if [ -z "$signing_identity" ]; then
+    echo "❌ Signing identity not found in $SIGNING_KEYCHAIN" >&2
+    exit 1
+  fi
+  codesign --force --sign "$signing_identity" build/VolumeMonitor.app
+  signature_details="$(codesign -d -vvv build/VolumeMonitor.app 2>&1 || true)"
+  if [[ "$signature_details" != *"Authority=$SIGNING_NAME"* ]]; then
     echo "❌ Signing verification failed: app is not signed by $SIGNING_NAME" >&2
     exit 1
   fi
