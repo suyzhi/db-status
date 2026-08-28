@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>VolumeMonitor</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.volumemonitor.app</string>
+    <key>CFBundleName</key>
+    <string>VolumeMonitor</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>用于读取系统正在播放的音频电平，并按耳机参数估算实时声压；正常音量监测不会使用麦克风。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>使用外接 EM258 麦克风完成耳机声压相对校准；正常音量监测不会使用麦克风。</string>
+</dict>
+</plist>

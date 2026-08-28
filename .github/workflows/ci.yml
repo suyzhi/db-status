@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build
+      - name: Unit tests
+        run: swift test
+      - name: Framework-independent logic smoke test
+        run: swift run VolumeMonitor --self-test-logic
+      - name: Verify packaging inputs
+        run: test -f Packaging/Info.plist && plutil -lint Packaging/Info.plist

@@ -1,16 +1,22 @@
 import CoreAudio
+import Darwin
 import Foundation
+import VolumeMonitorAtomics
 
 struct AudioLevelSnapshot: Sendable {
-    let rmsDBFS: Float
-    let peakDBFS: Float
+    let rmsAWeightedDBFS: Float
+    let peakUnweightedDBFS: Float
     let rmsLinear: Float
     let peakLinear: Float
     let status: AudioCaptureStatus
-    let lastSampleTime: Date?
+    let lastSampleMonotonicTime: Double?
+    let sampleRate: Double?
+    let formatDescription: String?
+    let frequencyCalibrationApplied: Bool
+    let calibrationFallbackReason: String?
 
     var hasUsableAudio: Bool {
-        status == .capturing && rmsDBFS > -80
+        status == .capturing && rmsAWeightedDBFS > -80
     }
 }
 
@@ -29,25 +35,28 @@ enum AudioMonitorError: LocalizedError {
     case audioUnavailable(OSStatus)
     case processTapCreationFailed(OSStatus)
     case aggregateCreationFailed(OSStatus)
+    case unsupportedAudioFormat(String)
     case ioProcCreationFailed(OSStatus)
     case startFailed(OSStatus)
 
     var errorDescription: String? {
         switch self {
         case .processTapUnsupported:
-            return "当前系统不支持 CoreAudio 系统音频 tap"
+            "当前系统不支持 CoreAudio 系统音频 tap"
         case .permissionRequired:
-            return "系统音频权限未授权"
+            "系统音频权限未授权"
         case .audioUnavailable:
-            return "当前没有可读取的系统输出音频"
+            "当前没有可读取的系统输出音频"
         case .processTapCreationFailed(let status):
-            return "系统音频 tap 创建失败 (\(Self.describe(status)))"
+            "系统音频 tap 创建失败 (\(Self.describe(status)))"
         case .aggregateCreationFailed(let status):
-            return "系统音频读取设备创建失败 (\(Self.describe(status)))"
+            "系统音频读取设备创建失败 (\(Self.describe(status)))"
+        case .unsupportedAudioFormat(let description):
+            "不支持的系统音频格式 (\(description))"
         case .ioProcCreationFailed(let status):
-            return "系统音频读取回调创建失败 (\(Self.describe(status)))"
+            "系统音频读取回调创建失败 (\(Self.describe(status)))"
         case .startFailed(let status):
-            return "系统音频读取启动失败 (\(Self.describe(status)))"
+            "系统音频读取启动失败 (\(Self.describe(status)))"
         }
     }
 
@@ -59,32 +68,50 @@ enum AudioMonitorError: LocalizedError {
             UInt8((code >> 8) & 0xff),
             UInt8(code & 0xff)
         ]
-
         if bytes.allSatisfy({ $0 >= 32 && $0 < 127 }),
            let fourCC = String(bytes: bytes, encoding: .macOSRoman) {
             return "\(status) / \(fourCC)"
         }
-
         return "\(status)"
     }
 }
 
 final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
     private let stateLock = NSLock()
+    private let captureQueue = DispatchQueue(label: "com.volumemonitor.audio-capture")
 
+    private let rmsBits = vm_atomic_u32_create(Float(-96).bitPattern)!
+    private let peakBits = vm_atomic_u32_create(Float(-96).bitPattern)!
+    private let rmsLinearBits = vm_atomic_u32_create(Float(0).bitPattern)!
+    private let peakLinearBits = vm_atomic_u32_create(Float(0).bitPattern)!
+    private let lastSampleBits = vm_atomic_u64_create(0)!
+    private let calibrationAppliedBits = vm_atomic_u32_create(0)!
+
+    // These resources are owned exclusively by captureQueue.
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
+    private var aWeightingMeter = AWeightingMeter(sampleRate: 48_000, channelCount: 2)
+    private var calibratedMeter: CalibratedAudioLevelMeter?
 
-    private var rmsLinear: Float = 0
-    private var peakLinear: Float = 0
-    private var rmsDBFS: Float = -96
-    private var peakDBFS: Float = -96
-    private var aWeightingMeter = AWeightingMeter(sampleRate: 48_000)
     private var status: AudioCaptureStatus = .idle
-    private var lastSampleTime: Date?
     private var shouldRun = false
-    private var isStarting = false
+    private var captureStartedMonotonicTime: Double?
+    private var sampleRate: Double?
+    private var audioFormatDescription: String?
+    private var audioChannelCount = 2
+    private var requestedCalibrationProfile: CalibrationProfile?
+    private var requestedCalibrationID: UUID?
+    private var calibrationFallbackReason: String?
+
+    deinit {
+        vm_atomic_u32_destroy(rmsBits)
+        vm_atomic_u32_destroy(peakBits)
+        vm_atomic_u32_destroy(rmsLinearBits)
+        vm_atomic_u32_destroy(peakLinearBits)
+        vm_atomic_u64_destroy(lastSampleBits)
+        vm_atomic_u32_destroy(calibrationAppliedBits)
+    }
 
     var hasStarted: Bool {
         stateLock.lock()
@@ -99,50 +126,108 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
             return
         }
         shouldRun = true
+        status = .starting
+        captureStartedMonotonicTime = Self.monotonicTime()
         stateLock.unlock()
 
-        startCapture()
+        captureQueue.async { [weak self] in self?.startCaptureOnQueue() }
     }
 
     func stop() {
         stateLock.lock()
         shouldRun = false
+        status = .idle
+        captureStartedMonotonicTime = nil
+        stateLock.unlock()
+        captureQueue.async { [weak self] in self?.stopCaptureOnQueue() }
+    }
+
+    func setCalibrationProfile(_ profile: CalibrationProfile?) {
+        stateLock.lock()
+        let newID = profile?.id
+        guard requestedCalibrationID != newID else {
+            stateLock.unlock()
+            return
+        }
+        requestedCalibrationID = newID
+        requestedCalibrationProfile = profile
+        let currentSampleRate = sampleRate
+        let channels = audioChannelCount
         stateLock.unlock()
 
-        stopCapture()
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            guard let profile,
+                  profile.frequencyCalibrationUsable,
+                  let currentSampleRate,
+                  let meter = CalibratedAudioLevelMeter(
+                    sampleRate: currentSampleRate,
+                    channelCount: channels,
+                    frequencyPoints: profile.frequencyPoints
+                  ) else {
+                calibratedMeter = nil
+                stateLock.lock()
+                calibrationFallbackReason = profile == nil ? nil : "FFT 校准引擎无法启用"
+                stateLock.unlock()
+                vm_atomic_u32_store(calibrationAppliedBits, 0)
+                return
+            }
+            calibratedMeter = meter
+            stateLock.lock()
+            calibrationFallbackReason = nil
+            stateLock.unlock()
+        }
     }
 
     func snapshot() -> AudioLevelSnapshot {
-        stateLock.lock()
-        defer { stateLock.unlock() }
+        let rms = Float(bitPattern: vm_atomic_u32_load(rmsBits))
+        let peak = Float(bitPattern: vm_atomic_u32_load(peakBits))
+        let linearRMS = Float(bitPattern: vm_atomic_u32_load(rmsLinearBits))
+        let linearPeak = Float(bitPattern: vm_atomic_u32_load(peakLinearBits))
+        let lastSampleRaw = vm_atomic_u64_load(lastSampleBits)
+        let lastSample = lastSampleRaw == 0 ? nil : Double(bitPattern: lastSampleRaw)
 
+        stateLock.lock()
         var effectiveStatus = status
+        let started = captureStartedMonotonicTime
+        let currentSampleRate = sampleRate
+        let currentFormat = audioFormatDescription
+        let fallbackReason = calibrationFallbackReason
+        stateLock.unlock()
+
         if status == .capturing {
-            if let lastSampleTime, Date().timeIntervalSince(lastSampleTime) > 2.0 {
+            let now = Self.monotonicTime()
+            if let lastSample, now - lastSample > 2 {
                 effectiveStatus = .noAudio
-            } else if rmsDBFS <= -80 {
+            } else if lastSample == nil, let started, now - started > 2 {
+                effectiveStatus = .noAudio
+            } else if rms <= -80 {
                 effectiveStatus = .noAudio
             }
         }
 
         return AudioLevelSnapshot(
-            rmsDBFS: rmsDBFS,
-            peakDBFS: peakDBFS,
-            rmsLinear: rmsLinear,
-            peakLinear: peakLinear,
+            rmsAWeightedDBFS: rms,
+            peakUnweightedDBFS: peak,
+            rmsLinear: linearRMS,
+            peakLinear: linearPeak,
             status: effectiveStatus,
-            lastSampleTime: lastSampleTime
+            lastSampleMonotonicTime: lastSample,
+            sampleRate: currentSampleRate,
+            formatDescription: currentFormat,
+            frequencyCalibrationApplied: vm_atomic_u32_load(calibrationAppliedBits) != 0,
+            calibrationFallbackReason: fallbackReason
         )
     }
 
-    private func startCapture() {
-        guard beginStarting() else { return }
-        defer { markStartFinished() }
-
-        setStatus(.starting)
-
+    private func startCaptureOnQueue() {
+        stopCaptureOnQueue(resetStatus: false)
         do {
             try configureCoreAudioTap()
+            guard readShouldRun() else {
+                stopCaptureOnQueue()
+                return
+            }
             setStatus(.capturing)
         } catch AudioMonitorError.permissionRequired(_) {
             finishStartFailure(.noPermission)
@@ -153,42 +238,37 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         }
     }
 
-    private func finishStartFailure(_ newStatus: AudioCaptureStatus) {
-        setStatus(newStatus)
-        stopCapture()
-
+    private func finishStartFailure(_ failureStatus: AudioCaptureStatus) {
+        stopCaptureOnQueue(resetStatus: false)
         stateLock.lock()
         shouldRun = false
+        status = failureStatus
         stateLock.unlock()
     }
 
-    private func stopCapture() {
+    private func stopCaptureOnQueue(resetStatus: Bool = true) {
         if let ioProcID, aggregateDeviceID != kAudioObjectUnknown {
             AudioDeviceStop(aggregateDeviceID, ioProcID)
             AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
         }
-
         if aggregateDeviceID != kAudioObjectUnknown {
             AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
         }
-
         if #available(macOS 14.2, *), tapID != kAudioObjectUnknown {
             AudioHardwareDestroyProcessTap(tapID)
         }
 
-        stateLock.lock()
         ioProcID = nil
         aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
         tapID = AudioObjectID(kAudioObjectUnknown)
-        rmsLinear = 0
-        peakLinear = 0
-        rmsDBFS = -96
-        peakDBFS = -96
         aWeightingMeter.reset()
-        lastSampleTime = nil
-        if !shouldRun {
-            status = .idle
-        }
+        calibratedMeter = nil
+        resetAtomicLevels()
+
+        stateLock.lock()
+        sampleRate = nil
+        audioFormatDescription = nil
+        if resetStatus, !shouldRun { status = .idle }
         stateLock.unlock()
     }
 
@@ -205,20 +285,11 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
 
         var newTapID = AudioObjectID(kAudioObjectUnknown)
         var result = AudioHardwareCreateProcessTap(description, &newTapID)
-        guard result == noErr else {
-            if Self.isPermissionStatus(result) {
-                throw AudioMonitorError.permissionRequired(result)
-            }
-            if Self.isAudioUnavailableStatus(result) {
-                throw AudioMonitorError.audioUnavailable(result)
-            }
-            throw AudioMonitorError.processTapCreationFailed(result)
-        }
+        guard result == noErr else { throw Self.errorForTap(result) }
 
-        let aggregateUID = "com.volumemonitor.audio-tap.\(UUID().uuidString)"
         let aggregateDescription: NSDictionary = [
             kAudioAggregateDeviceNameKey: "VolumeMonitor Audio Tap",
-            kAudioAggregateDeviceUIDKey: aggregateUID,
+            kAudioAggregateDeviceUIDKey: "com.volumemonitor.audio-tap.\(UUID().uuidString)",
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceTapListKey: [
@@ -230,13 +301,46 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         result = AudioHardwareCreateAggregateDevice(aggregateDescription, &newAggregateID)
         guard result == noErr else {
             AudioHardwareDestroyProcessTap(newTapID)
-            if Self.isPermissionStatus(result) {
-                throw AudioMonitorError.permissionRequired(result)
+            throw Self.errorForAggregate(result)
+        }
+
+        guard let streamFormat = Self.streamFormat(deviceID: newAggregateID) else {
+            AudioHardwareDestroyAggregateDevice(newAggregateID)
+            AudioHardwareDestroyProcessTap(newTapID)
+            throw AudioMonitorError.unsupportedAudioFormat("无法读取流格式")
+        }
+        let formatText = Self.describe(streamFormat)
+        guard streamFormat.mFormatID == kAudioFormatLinearPCM,
+              streamFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              streamFormat.mBitsPerChannel == 32,
+              streamFormat.mSampleRate > 0,
+              streamFormat.mChannelsPerFrame > 0 else {
+            AudioHardwareDestroyAggregateDevice(newAggregateID)
+            AudioHardwareDestroyProcessTap(newTapID)
+            throw AudioMonitorError.unsupportedAudioFormat(formatText)
+        }
+
+        aWeightingMeter = AWeightingMeter(
+            sampleRate: streamFormat.mSampleRate,
+            channelCount: Int(streamFormat.mChannelsPerFrame)
+        )
+        stateLock.lock()
+        sampleRate = streamFormat.mSampleRate
+        audioChannelCount = Int(streamFormat.mChannelsPerFrame)
+        audioFormatDescription = formatText
+        let calibrationProfile = requestedCalibrationProfile
+        stateLock.unlock()
+        if let calibrationProfile, calibrationProfile.frequencyCalibrationUsable {
+            calibratedMeter = CalibratedAudioLevelMeter(
+                sampleRate: streamFormat.mSampleRate,
+                channelCount: Int(streamFormat.mChannelsPerFrame),
+                frequencyPoints: calibrationProfile.frequencyPoints
+            )
+            if calibratedMeter == nil {
+                stateLock.lock()
+                calibrationFallbackReason = "FFT 校准引擎初始化失败"
+                stateLock.unlock()
             }
-            if Self.isAudioUnavailableStatus(result) {
-                throw AudioMonitorError.audioUnavailable(result)
-            }
-            throw AudioMonitorError.aggregateCreationFailed(result)
         }
 
         var newIOProcID: AudioDeviceIOProcID?
@@ -250,17 +354,7 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         guard result == noErr, let newIOProcID else {
             AudioHardwareDestroyAggregateDevice(newAggregateID)
             AudioHardwareDestroyProcessTap(newTapID)
-            if Self.isPermissionStatus(result) {
-                throw AudioMonitorError.permissionRequired(result)
-            }
-            if Self.isAudioUnavailableStatus(result) {
-                throw AudioMonitorError.audioUnavailable(result)
-            }
-            throw AudioMonitorError.ioProcCreationFailed(result)
-        }
-
-        if let sampleRate = Self.nominalSampleRate(deviceID: newAggregateID) {
-            aWeightingMeter = AWeightingMeter(sampleRate: sampleRate)
+            throw Self.errorForIOProc(result)
         }
 
         result = AudioDeviceStart(newAggregateID, newIOProcID)
@@ -268,20 +362,12 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
             AudioDeviceDestroyIOProcID(newAggregateID, newIOProcID)
             AudioHardwareDestroyAggregateDevice(newAggregateID)
             AudioHardwareDestroyProcessTap(newTapID)
-            if Self.isPermissionStatus(result) {
-                throw AudioMonitorError.permissionRequired(result)
-            }
-            if Self.isAudioUnavailableStatus(result) {
-                throw AudioMonitorError.audioUnavailable(result)
-            }
-            throw AudioMonitorError.startFailed(result)
+            throw Self.errorForStart(result)
         }
 
-        stateLock.lock()
         tapID = newTapID
         aggregateDeviceID = newAggregateID
         ioProcID = newIOProcID
-        stateLock.unlock()
     }
 
     private func currentProcessObjectID() -> AudioObjectID? {
@@ -294,45 +380,43 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         var processObjectID = AudioObjectID(kAudioObjectUnknown)
         var dataSize = UInt32(MemoryLayout<AudioObjectID>.size)
         let qualifierSize = UInt32(MemoryLayout<pid_t>.size)
-
-        let result = withUnsafePointer(to: &pid) { pidPointer in
+        let result = withUnsafePointer(to: &pid) {
             AudioObjectGetPropertyData(
                 AudioObjectID(kAudioObjectSystemObject),
                 &address,
                 qualifierSize,
-                pidPointer,
+                $0,
                 &dataSize,
                 &processObjectID
             )
         }
-
-        guard result == noErr, processObjectID != kAudioObjectUnknown else { return nil }
-        return processObjectID
+        return result == noErr && processObjectID != kAudioObjectUnknown ? processObjectID : nil
     }
 
     fileprivate func processAudioBufferList(_ audioBufferList: UnsafePointer<AudioBufferList>?) {
         guard let audioBufferList,
-              let levels = aWeightingMeter.measure(audioBufferList) else {
-            return
-        }
+              let standardLevels = aWeightingMeter.measure(audioBufferList) else { return }
+        let calibratedLevels = calibratedMeter?.measure(audioBufferList)
+        let levels = calibratedLevels ?? standardLevels
+        vm_atomic_u32_store(calibrationAppliedBits, calibratedLevels == nil ? 0 : 1)
 
-        updateLevels(rms: levels.rms, peak: levels.peak)
+        let oldRMS = Float(bitPattern: vm_atomic_u32_load(rmsLinearBits))
+        let oldPeak = Float(bitPattern: vm_atomic_u32_load(peakLinearBits))
+        let smoothing: Float = levels.rms > oldRMS ? 0.55 : 0.16
+        let smoothedRMS = oldRMS + (levels.rms - oldRMS) * smoothing
+        let smoothedPeak = max(levels.peak, oldPeak * 0.82)
+
+        vm_atomic_u32_store(rmsLinearBits, smoothedRMS.bitPattern)
+        vm_atomic_u32_store(peakLinearBits, smoothedPeak.bitPattern)
+        vm_atomic_u32_store(rmsBits, Self.dbFS(fromLinear: smoothedRMS).bitPattern)
+        vm_atomic_u32_store(peakBits, Self.dbFS(fromLinear: smoothedPeak).bitPattern)
+        vm_atomic_u64_store(lastSampleBits, Self.monotonicTime().bitPattern)
     }
 
-    private func updateLevels(rms: Float, peak: Float) {
+    private func readShouldRun() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-
-        let attack: Float = 0.55
-        let release: Float = 0.16
-        let smoothing = rms > rmsLinear ? attack : release
-
-        rmsLinear = rmsLinear + (rms - rmsLinear) * smoothing
-        peakLinear = max(peak, peakLinear * 0.82)
-        rmsDBFS = Self.dbFS(fromLinear: rmsLinear)
-        peakDBFS = Self.dbFS(fromLinear: peakLinear)
-        lastSampleTime = Date()
-        status = .capturing
+        return shouldRun
     }
 
     private func setStatus(_ newStatus: AudioCaptureStatus) {
@@ -341,19 +425,13 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         stateLock.unlock()
     }
 
-    private func beginStarting() -> Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-
-        guard !isStarting, aggregateDeviceID == kAudioObjectUnknown else { return false }
-        isStarting = true
-        return true
-    }
-
-    private func markStartFinished() {
-        stateLock.lock()
-        isStarting = false
-        stateLock.unlock()
+    private func resetAtomicLevels() {
+        vm_atomic_u32_store(rmsBits, Float(-96).bitPattern)
+        vm_atomic_u32_store(peakBits, Float(-96).bitPattern)
+        vm_atomic_u32_store(rmsLinearBits, Float(0).bitPattern)
+        vm_atomic_u32_store(peakLinearBits, Float(0).bitPattern)
+        vm_atomic_u64_store(lastSampleBits, 0)
+        vm_atomic_u32_store(calibrationAppliedBits, 0)
     }
 
     private static func dbFS(fromLinear value: Float) -> Float {
@@ -361,9 +439,46 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         return max(-96, min(0, 20 * log10(value)))
     }
 
+    private static func monotonicTime() -> Double {
+        Double(mach_continuous_time()) * secondsPerTick
+    }
+
+    private static let secondsPerTick: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom) / 1_000_000_000
+    }()
+
+    private static func streamFormat(deviceID: AudioObjectID) -> AudioStreamBasicDescription? {
+        for scope in [kAudioDevicePropertyScopeInput, kAudioDevicePropertyScopeOutput] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreamFormat,
+                mScope: scope,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectHasProperty(deviceID, &address) else { continue }
+            var format = AudioStreamBasicDescription()
+            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &format) == noErr {
+                return format
+            }
+        }
+        return nil
+    }
+
+    private static func describe(_ format: AudioStreamBasicDescription) -> String {
+        let interleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        return String(
+            format: "%.0f Hz / %u ch / %u bit / %@",
+            format.mSampleRate,
+            format.mChannelsPerFrame,
+            format.mBitsPerChannel,
+            interleaved ? "interleaved" : "non-interleaved"
+        )
+    }
+
     private static func isPermissionStatus(_ status: OSStatus) -> Bool {
-        status == kAudioDevicePermissionsError ||
-        status == kAudioHardwareIllegalOperationError
+        status == kAudioDevicePermissionsError || status == kAudioHardwareIllegalOperationError
     }
 
     private static func isAudioUnavailableStatus(_ status: OSStatus) -> Bool {
@@ -373,185 +488,238 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         status == kAudioHardwareBadObjectError
     }
 
-    private static func nominalSampleRate(deviceID: AudioObjectID) -> Double? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
+    private static func errorForTap(_ status: OSStatus) -> AudioMonitorError {
+        if isPermissionStatus(status) { return .permissionRequired(status) }
+        if isAudioUnavailableStatus(status) { return .audioUnavailable(status) }
+        return .processTapCreationFailed(status)
+    }
 
-        guard AudioObjectHasProperty(deviceID, &address) else { return nil }
+    private static func errorForAggregate(_ status: OSStatus) -> AudioMonitorError {
+        if isPermissionStatus(status) { return .permissionRequired(status) }
+        if isAudioUnavailableStatus(status) { return .audioUnavailable(status) }
+        return .aggregateCreationFailed(status)
+    }
 
-        var sampleRate = Float64(0)
-        var size = UInt32(MemoryLayout<Float64>.size)
-        let result = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &sampleRate)
-        guard result == noErr, sampleRate > 0 else { return nil }
-        return sampleRate
+    private static func errorForIOProc(_ status: OSStatus) -> AudioMonitorError {
+        if isPermissionStatus(status) { return .permissionRequired(status) }
+        if isAudioUnavailableStatus(status) { return .audioUnavailable(status) }
+        return .ioProcCreationFailed(status)
+    }
+
+    private static func errorForStart(_ status: OSStatus) -> AudioMonitorError {
+        if isPermissionStatus(status) { return .permissionRequired(status) }
+        if isAudioUnavailableStatus(status) { return .audioUnavailable(status) }
+        return .startFailed(status)
     }
 }
 
-private final class AWeightingMeter {
-    private let coefficients: IIRCoefficients
-    private var filters: [IIRFilter] = []
+struct BiquadCoefficients: Sendable {
+    let b0: Double
+    let b1: Double
+    let b2: Double
+    let a1: Double
+    let a2: Double
 
-    init(sampleRate: Double) {
-        coefficients = IIRCoefficients.aWeighting(sampleRate: sampleRate)
+    static func bilinear(
+        sampleRate: Double,
+        numerator: (Double, Double, Double),
+        denominator: (Double, Double, Double)
+    ) -> BiquadCoefficients {
+        let c = 2 * sampleRate
+        let c2 = c * c
+        let (b2s, b1s, b0s) = numerator
+        let (a2s, a1s, a0s) = denominator
+        let b0 = b2s * c2 + b1s * c + b0s
+        let b1 = -2 * b2s * c2 + 2 * b0s
+        let b2 = b2s * c2 - b1s * c + b0s
+        let a0 = a2s * c2 + a1s * c + a0s
+        let a1 = -2 * a2s * c2 + 2 * a0s
+        let a2 = a2s * c2 - a1s * c + a0s
+        return BiquadCoefficients(
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0
+        )
+    }
+
+    func magnitude(frequency: Double, sampleRate: Double) -> Double {
+        let omega = -2 * Double.pi * frequency / sampleRate
+        let z1 = Complex(cos(omega), sin(omega))
+        let z2 = z1 * z1
+        let numerator = Complex(b0, 0) + z1 * b1 + z2 * b2
+        let denominator = Complex(1, 0) + z1 * a1 + z2 * a2
+        return (numerator / denominator).magnitude
+    }
+}
+
+private struct BiquadState {
+    let coefficients: BiquadCoefficients
+    var z1 = 0.0
+    var z2 = 0.0
+
+    mutating func process(_ input: Double) -> Double {
+        let output = coefficients.b0 * input + z1
+        z1 = coefficients.b1 * input - coefficients.a1 * output + z2
+        z2 = coefficients.b2 * input - coefficients.a2 * output
+        return output
+    }
+}
+
+private struct ChannelAWeightingFilter {
+    var sections: [BiquadState]
+    let gain: Double
+
+    mutating func process(_ input: Double) -> Double {
+        var output = input
+        for index in sections.indices {
+            output = sections[index].process(output)
+        }
+        return output * gain
+    }
+}
+
+final class AWeightingMeter {
+    let sampleRate: Double
+    private let coefficients: [BiquadCoefficients]
+    private let normalizationGain: Double
+    private var filters: [ChannelAWeightingFilter]
+
+    init(sampleRate: Double, channelCount: Int) {
+        self.sampleRate = sampleRate
+        let sectionCoefficients = Self.makeCoefficients(sampleRate: sampleRate)
+        coefficients = sectionCoefficients
+        let magnitudeAt1K = sectionCoefficients.reduce(1.0) {
+            $0 * $1.magnitude(frequency: 1_000, sampleRate: sampleRate)
+        }
+        let gain = magnitudeAt1K > 0 ? 1 / magnitudeAt1K : 1
+        normalizationGain = gain
+        filters = (0..<max(1, channelCount)).map { _ in
+            ChannelAWeightingFilter(
+                sections: sectionCoefficients.map { BiquadState(coefficients: $0) },
+                gain: gain
+            )
+        }
     }
 
     func reset() {
-        filters.removeAll()
+        filters = filters.map { _ in
+            ChannelAWeightingFilter(
+                sections: coefficients.map { BiquadState(coefficients: $0) },
+                gain: normalizationGain
+            )
+        }
+    }
+
+    func frequencyResponseDB(at frequency: Double) -> Double {
+        let magnitude = coefficients.reduce(normalizationGain) {
+            $0 * $1.magnitude(frequency: frequency, sampleRate: sampleRate)
+        }
+        return 20 * log10(max(magnitude, .leastNonzeroMagnitude))
     }
 
     func measure(_ audioBufferList: UnsafePointer<AudioBufferList>) -> (rms: Float, peak: Float)? {
         let buffers = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: audioBufferList)
         )
-
-        var sumSquares: Double = 0
+        var sumSquares = 0.0
         var peak: Float = 0
         var sampleCount = 0
         var channelOffset = 0
 
         for buffer in buffers {
             guard let data = buffer.mData else { continue }
-
             let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
-            guard count > 0 else { continue }
-
             let channelCount = max(1, Int(buffer.mNumberChannels))
             let frameCount = count / channelCount
-            guard frameCount > 0 else { continue }
-
-            ensureFilterCount(channelOffset + channelCount)
+            guard frameCount > 0, channelOffset + channelCount <= filters.count else { return nil }
             let samples = data.bindMemory(to: Float.self, capacity: count)
 
             for frame in 0..<frameCount {
                 for channel in 0..<channelCount {
-                    let index = frame * channelCount + channel
-                    let sample = samples[index]
-                    let magnitude = abs(sample)
-                    peak = max(peak, magnitude)
-
-                    let weightedSample = filters[channelOffset + channel].process(Double(sample))
-                    sumSquares += weightedSample * weightedSample
+                    let sample = samples[frame * channelCount + channel]
+                    peak = max(peak, abs(sample))
+                    let weighted = filters[channelOffset + channel].process(Double(sample))
+                    sumSquares += weighted * weighted
                 }
             }
-
             sampleCount += frameCount * channelCount
             channelOffset += channelCount
         }
 
         guard sampleCount > 0 else { return nil }
-
-        let rms = Float(sqrt(sumSquares / Double(sampleCount)))
-        return (rms: min(max(rms, 0), 1), peak: min(max(peak, 0), 1))
-    }
-
-    private func ensureFilterCount(_ count: Int) {
-        while filters.count < count {
-            filters.append(IIRFilter(coefficients: coefficients))
-        }
-    }
-}
-
-private struct IIRCoefficients {
-    let b: [Double]
-    let a: [Double]
-
-    static func aWeighting(sampleRate: Double) -> IIRCoefficients {
-        let f1 = 20.598997
-        let f2 = 107.65265
-        let f3 = 737.86223
-        let f4 = 12_194.217
-        let a1000 = 1.9997
-
-        let w1 = 2 * Double.pi * f1
-        let w2 = 2 * Double.pi * f2
-        let w3 = 2 * Double.pi * f3
-        let w4 = 2 * Double.pi * f4
-
-        var denominator = polyMultiply([1, 2 * w4, w4 * w4], [1, 2 * w1, w1 * w1])
-        denominator = polyMultiply(denominator, [1, w3])
-        denominator = polyMultiply(denominator, [1, w2])
-
-        let order = denominator.count - 1
-        let gain = w4 * w4 * pow(10, a1000 / 20)
-        let numerator = [0, 0, gain, 0, 0, 0, 0]
-
-        let digitalB = bilinearTransform(numerator, sampleRate: sampleRate, order: order)
-        let digitalA = bilinearTransform(denominator, sampleRate: sampleRate, order: order)
-        let a0 = digitalA[0]
-
-        return IIRCoefficients(
-            b: digitalB.map { $0 / a0 },
-            a: digitalA.map { $0 / a0 }
+        return (
+            rms: min(max(Float(sqrt(sumSquares / Double(sampleCount))), 0), 1),
+            peak: min(max(peak, 0), 1)
         )
     }
 
-    private static func bilinearTransform(_ coefficients: [Double], sampleRate: Double, order: Int) -> [Double] {
-        let c = 2 * sampleRate
-        var result = Array(repeating: 0.0, count: order + 1)
-
-        for (index, coefficient) in coefficients.enumerated() where coefficient != 0 {
-            let power = order - index
-            let left = polyPower([1, -1], power)
-            let right = polyPower([1, 1], order - power)
-            let term = polyMultiply(left, right).map { $0 * coefficient * pow(c, Double(power)) }
-
-            for termIndex in term.indices {
-                result[termIndex] += term[termIndex]
-            }
-        }
-
-        return result
-    }
-
-    private static func polyPower(_ polynomial: [Double], _ power: Int) -> [Double] {
-        guard power > 0 else { return [1] }
-        var result = [1.0]
-        for _ in 0..<power {
-            result = polyMultiply(result, polynomial)
-        }
-        return result
-    }
-
-    private static func polyMultiply(_ lhs: [Double], _ rhs: [Double]) -> [Double] {
-        var result = Array(repeating: 0.0, count: lhs.count + rhs.count - 1)
-        for (leftIndex, leftValue) in lhs.enumerated() {
-            for (rightIndex, rightValue) in rhs.enumerated() {
-                result[leftIndex + rightIndex] += leftValue * rightValue
-            }
-        }
-        return result
+    private static func makeCoefficients(sampleRate: Double) -> [BiquadCoefficients] {
+        let w1 = 2 * Double.pi * 20.598997
+        let w2 = 2 * Double.pi * 107.65265
+        let w3 = 2 * Double.pi * 737.86223
+        let w4 = 2 * Double.pi * 12_194.217
+        return [
+            .bilinear(
+                sampleRate: sampleRate,
+                numerator: (1, 0, 0),
+                denominator: (1, 2 * w1, w1 * w1)
+            ),
+            .bilinear(
+                sampleRate: sampleRate,
+                numerator: (0, 1, 0),
+                denominator: (1, w2 + w3, w2 * w3)
+            ),
+            .bilinear(
+                sampleRate: sampleRate,
+                numerator: (0, 1, 0),
+                denominator: (1, 2 * w4, w4 * w4)
+            )
+        ]
     }
 }
 
-private struct IIRFilter {
-    private let coefficients: IIRCoefficients
-    private var state: [Double]
+private struct Complex {
+    let real: Double
+    let imaginary: Double
 
-    init(coefficients: IIRCoefficients) {
-        self.coefficients = coefficients
-        state = Array(repeating: 0, count: max(0, coefficients.b.count - 1))
+    init(_ real: Double, _ imaginary: Double) {
+        self.real = real
+        self.imaginary = imaginary
     }
 
-    mutating func process(_ input: Double) -> Double {
-        guard !state.isEmpty else { return coefficients.b[0] * input }
+    var magnitude: Double { hypot(real, imaginary) }
 
-        let output = coefficients.b[0] * input + state[0]
-        for index in 1..<state.count {
-            state[index - 1] = coefficients.b[index] * input + state[index] - coefficients.a[index] * output
-        }
-        state[state.count - 1] = coefficients.b[state.count] * input - coefficients.a[state.count] * output
-        return output
+    static func +(lhs: Complex, rhs: Complex) -> Complex {
+        Complex(lhs.real + rhs.real, lhs.imaginary + rhs.imaginary)
+    }
+
+    static func *(lhs: Complex, rhs: Complex) -> Complex {
+        Complex(
+            lhs.real * rhs.real - lhs.imaginary * rhs.imaginary,
+            lhs.real * rhs.imaginary + lhs.imaginary * rhs.real
+        )
+    }
+
+    static func *(lhs: Complex, rhs: Double) -> Complex {
+        Complex(lhs.real * rhs, lhs.imaginary * rhs)
+    }
+
+    static func /(lhs: Complex, rhs: Complex) -> Complex {
+        let denominator = rhs.real * rhs.real + rhs.imaginary * rhs.imaginary
+        return Complex(
+            (lhs.real * rhs.real + lhs.imaginary * rhs.imaginary) / denominator,
+            (lhs.imaginary * rhs.real - lhs.real * rhs.imaginary) / denominator
+        )
     }
 }
 
 private let systemAudioTapIOProc: AudioDeviceIOProc = { _, _, inputData, _, _, _, clientData in
     guard let clientData else { return noErr }
-    let monitor = Unmanaged<SystemAudioLevelMonitor>
+    Unmanaged<SystemAudioLevelMonitor>
         .fromOpaque(clientData)
         .takeUnretainedValue()
-    monitor.processAudioBufferList(inputData)
+        .processAudioBufferList(inputData)
     return noErr
 }

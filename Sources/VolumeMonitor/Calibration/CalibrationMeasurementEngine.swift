@@ -1,0 +1,370 @@
+import Foundation
+
+enum CalibrationMeasurementMath {
+    static func normalizedAcousticLevel(
+        microphoneLevelDBFS: Double,
+        signalRMSDBFS: Double
+    ) -> Double {
+        microphoneLevelDBFS - signalRMSDBFS
+    }
+
+    static func relativeDB(
+        microphoneLevelDBFS: Double,
+        signalRMSDBFS: Double,
+        referenceMicrophoneLevelDBFS: Double,
+        referenceSignalRMSDBFS: Double
+    ) -> Double {
+        normalizedAcousticLevel(
+            microphoneLevelDBFS: microphoneLevelDBFS,
+            signalRMSDBFS: signalRMSDBFS
+        ) - normalizedAcousticLevel(
+            microphoneLevelDBFS: referenceMicrophoneLevelDBFS,
+            signalRMSDBFS: referenceSignalRMSDBFS
+        )
+    }
+}
+
+struct CalibrationProgress: Sendable, Equatable {
+    let message: String
+    let fraction: Double
+    let retry: Int
+}
+
+struct FrequencySweepResult: Sendable, Equatable {
+    let points: [FrequencyCalibrationPoint]
+    let minimumSNRDB: Double
+    let testSignalRMSDBFS: Double
+}
+
+struct VolumeSweepResult: Sendable, Equatable {
+    let points: [VolumeCalibrationPoint]
+    let minimumSNRDB: Double
+    let referenceNormalizedLevelDBFS: Double
+    let testSignalRMSDBFS: Double
+}
+
+struct RelativeValidationResult: Sendable, Equatable {
+    let systemVolume: Float
+    let predictedRelativeDB: Double
+    let measuredRelativeDB: Double
+    let absoluteErrorDB: Double
+}
+
+enum CalibrationMeasurementError: LocalizedError {
+    case outputDeviceChanged
+    case inputDeviceChanged
+    case volumeUnavailable(Float)
+    case noMeasurement(Double)
+    case clipping(Double)
+    case insufficientSNR(frequency: Double, snr: Double)
+    case unstable(frequency: Double, stability: Double)
+
+    var errorDescription: String? {
+        switch self {
+        case .outputDeviceChanged: "输出设备在校准过程中发生变化，测试已停止"
+        case .inputDeviceChanged: "校准麦克风已断开或发生变化，测试已停止"
+        case .volumeUnavailable(let volume): "请把系统音量调到 \(Int(volume * 100))% 后重试"
+        case .noMeasurement(let frequency): "\(Int(frequency)) Hz 没有获得足够的麦克风数据"
+        case .clipping(let frequency): "\(Int(frequency)) Hz 测量时麦克风输入接近削波"
+        case .insufficientSNR(let frequency, let snr):
+            "\(Int(frequency)) Hz 信噪比不足（\(String(format: "%.1f", snr)) dB）"
+        case .unstable(let frequency, let stability):
+            "\(Int(frequency)) Hz 测量不稳定（\(String(format: "%.2f", stability)) dB）"
+        }
+    }
+}
+
+@MainActor
+final class CalibrationMeasurementEngine {
+    typealias ProgressHandler = @MainActor (CalibrationProgress) -> Void
+
+    private let microphone: CalibrationMicrophoneMonitor
+    private let toneGenerator: CalibrationToneGenerator
+    private let outputMonitor: OutputDeviceMonitor
+    private(set) var isRunning = false
+
+    init(
+        microphone: CalibrationMicrophoneMonitor,
+        toneGenerator: CalibrationToneGenerator,
+        outputMonitor: OutputDeviceMonitor
+    ) {
+        self.microphone = microphone
+        self.toneGenerator = toneGenerator
+        self.outputMonitor = outputMonitor
+    }
+
+    func cancel() {
+        toneGenerator.stop()
+    }
+
+    func measureFrequencyResponse(
+        outputDeviceUID: String,
+        testSignalRMSDBFS: Double,
+        progress: @escaping ProgressHandler
+    ) async throws -> FrequencySweepResult {
+        let originalVolume = outputMonitor.snapshot().volumeScalar
+        isRunning = true
+        defer {
+            toneGenerator.stop()
+            if let originalVolume { _ = outputMonitor.setVolumeScalar(originalVolume) }
+            isRunning = false
+        }
+        try await setOrAwaitVolume(0.5, progress: progress)
+
+        var measurements: [(measurement: CalibrationFrequencyMeasurement, signalRMSDBFS: Double)] = []
+        var currentLevel = testSignalRMSDBFS
+        for (index, frequency) in CalibrationProfile.requiredFrequenciesHz.enumerated() {
+            try Task.checkCancellation()
+            try verifyDevices(outputDeviceUID: outputDeviceUID)
+            let fraction = Double(index) / Double(CalibrationProfile.requiredFrequenciesHz.count)
+            let result = try await measureWithRetries(
+                frequencyHz: frequency,
+                initialRMSDBFS: currentLevel,
+                baseFraction: fraction,
+                progress: progress
+            )
+            currentLevel = min(currentLevel, result.usedSignalRMSDBFS)
+            measurements.append((result.measurement, result.usedSignalRMSDBFS))
+        }
+
+        guard let reference = measurements.first(where: {
+            abs($0.measurement.frequencyHz - 1_000) < 0.5
+        }) else {
+            throw CalibrationMeasurementError.noMeasurement(1_000)
+        }
+        let referenceNormalized = CalibrationMeasurementMath.normalizedAcousticLevel(
+            microphoneLevelDBFS: reference.measurement.levelDBFS,
+            signalRMSDBFS: reference.signalRMSDBFS
+        )
+        let points = measurements.map { item in
+            FrequencyCalibrationPoint(
+                frequencyHz: item.measurement.frequencyHz,
+                relativeDB: CalibrationMeasurementMath.normalizedAcousticLevel(
+                    microphoneLevelDBFS: item.measurement.levelDBFS,
+                    signalRMSDBFS: item.signalRMSDBFS
+                ) - referenceNormalized,
+                stabilityDB: item.measurement.stabilityDB,
+                measuredLevelDBFS: item.measurement.levelDBFS
+            )
+        }
+        progress(CalibrationProgress(message: "9 个频率点测量完成", fraction: 1, retry: 0))
+        return FrequencySweepResult(
+            points: points,
+            minimumSNRDB: measurements.map(\.measurement.snrDB).min() ?? 0,
+            testSignalRMSDBFS: currentLevel
+        )
+    }
+
+    func measureVolumeCurve(
+        outputDeviceUID: String,
+        testSignalRMSDBFS: Double,
+        progress: @escaping ProgressHandler
+    ) async throws -> VolumeSweepResult {
+        let originalVolume = outputMonitor.snapshot().volumeScalar
+        isRunning = true
+        defer {
+            toneGenerator.stop()
+            if let originalVolume { _ = outputMonitor.setVolumeScalar(originalVolume) }
+            isRunning = false
+        }
+
+        var measurements: [(
+            volume: Float,
+            measurement: CalibrationFrequencyMeasurement,
+            signalRMSDBFS: Double
+        )] = []
+        var currentLevel = testSignalRMSDBFS
+        for (index, volume) in CalibrationProfile.requiredVolumes.enumerated() {
+            try Task.checkCancellation()
+            try verifyDevices(outputDeviceUID: outputDeviceUID)
+            progress(CalibrationProgress(
+                message: "正在设置系统音量到 \(Int(volume * 100))%",
+                fraction: Double(index) / 3,
+                retry: 0
+            ))
+            try await setOrAwaitVolume(volume, progress: progress)
+            let result = try await measureWithRetries(
+                frequencyHz: 1_000,
+                initialRMSDBFS: currentLevel,
+                baseFraction: Double(index) / 3,
+                progress: progress
+            )
+            currentLevel = min(currentLevel, result.usedSignalRMSDBFS)
+            measurements.append((volume, result.measurement, result.usedSignalRMSDBFS))
+        }
+
+        guard let reference = measurements.first(where: { abs($0.volume - 0.5) < 0.002 }) else {
+            throw CalibrationMeasurementError.noMeasurement(1_000)
+        }
+        let referenceNormalized = CalibrationMeasurementMath.normalizedAcousticLevel(
+            microphoneLevelDBFS: reference.measurement.levelDBFS,
+            signalRMSDBFS: reference.signalRMSDBFS
+        )
+        let points = measurements.map { item in
+            VolumeCalibrationPoint(
+                systemVolume: item.volume,
+                relativeDB: CalibrationMeasurementMath.normalizedAcousticLevel(
+                    microphoneLevelDBFS: item.measurement.levelDBFS,
+                    signalRMSDBFS: item.signalRMSDBFS
+                ) - referenceNormalized,
+                stabilityDB: item.measurement.stabilityDB,
+                measuredLevelDBFS: item.measurement.levelDBFS
+            )
+        }
+        progress(CalibrationProgress(message: "3 个系统音量点测量完成", fraction: 1, retry: 0))
+        return VolumeSweepResult(
+            points: points,
+            minimumSNRDB: measurements.map(\.measurement.snrDB).min() ?? 0,
+            referenceNormalizedLevelDBFS: referenceNormalized,
+            testSignalRMSDBFS: currentLevel
+        )
+    }
+
+    func validateVolumeCurve(
+        outputDeviceUID: String,
+        volumeResult: VolumeSweepResult,
+        progress: @escaping ProgressHandler
+    ) async throws -> RelativeValidationResult {
+        let validationVolume: Float = 0.6
+        let originalVolume = outputMonitor.snapshot().volumeScalar
+        isRunning = true
+        defer {
+            toneGenerator.stop()
+            if let originalVolume { _ = outputMonitor.setVolumeScalar(originalVolume) }
+            isRunning = false
+        }
+        try verifyDevices(outputDeviceUID: outputDeviceUID)
+        try await setOrAwaitVolume(validationVolume, progress: progress)
+        progress(CalibrationProgress(message: "正在 60% 音量进行独立验证", fraction: 0.2, retry: 0))
+        let result = try await measureWithRetries(
+            frequencyHz: 1_000,
+            initialRMSDBFS: volumeResult.testSignalRMSDBFS,
+            baseFraction: 0.3,
+            progress: progress
+        )
+        guard let curve = VolumeCalibrationCurve(points: volumeResult.points) else {
+            throw CalibrationStoreError.invalidProfile("音量曲线无法插值")
+        }
+        let predicted = curve.relativeDB(at: validationVolume) - curve.relativeDB(at: 0.5)
+        let measured = CalibrationMeasurementMath.normalizedAcousticLevel(
+            microphoneLevelDBFS: result.measurement.levelDBFS,
+            signalRMSDBFS: result.usedSignalRMSDBFS
+        )
+            - volumeResult.referenceNormalizedLevelDBFS
+        let error = abs(predicted - measured)
+        progress(CalibrationProgress(
+            message: error <= 1 ? "音量曲线验证通过" : "验证偏差较大，建议重新测试",
+            fraction: 1,
+            retry: 0
+        ))
+        return RelativeValidationResult(
+            systemVolume: validationVolume,
+            predictedRelativeDB: predicted,
+            measuredRelativeDB: measured,
+            absoluteErrorDB: error
+        )
+    }
+
+    private func measureWithRetries(
+        frequencyHz: Double,
+        initialRMSDBFS: Double,
+        baseFraction: Double,
+        progress: @escaping ProgressHandler
+    ) async throws -> (measurement: CalibrationFrequencyMeasurement, usedSignalRMSDBFS: Double) {
+        var signalLevel = initialRMSDBFS
+        var lastError: Error = CalibrationMeasurementError.noMeasurement(frequencyHz)
+        for attempt in 0...2 {
+            try Task.checkCancellation()
+            let label = attempt == 0 ? "" : "（自动重测 \(attempt)/2）"
+            progress(CalibrationProgress(
+                message: "测量 \(Int(frequencyHz)) Hz\(label)",
+                fraction: min(0.99, baseFraction),
+                retry: attempt
+            ))
+
+            microphone.beginFrequencyMeasurement(frequencyHz)
+            try await Task.sleep(for: .milliseconds(450))
+            let noise = microphone.finishFrequencyMeasurement()?.levelDBFS
+                ?? microphone.snapshot.noiseFloorDBFS
+
+            let attemptSignalLevel = signalLevel
+            let toneTask = Task { @MainActor in
+                try await toneGenerator.playTone(
+                    frequencyHz: frequencyHz,
+                    duration: 2.2,
+                    rmsDBFS: attemptSignalLevel
+                )
+            }
+            defer { toneTask.cancel() }
+            try await Task.sleep(for: .milliseconds(800))
+            microphone.beginFrequencyMeasurement(frequencyHz)
+            try await Task.sleep(for: .milliseconds(1_050))
+            guard let measurement = microphone.finishFrequencyMeasurement(noiseFloorDBFS: noise) else {
+                lastError = CalibrationMeasurementError.noMeasurement(frequencyHz)
+                continue
+            }
+            _ = try? await toneTask.value
+
+            if measurement.isClipping {
+                lastError = CalibrationMeasurementError.clipping(frequencyHz)
+                signalLevel -= 4
+                continue
+            }
+            if measurement.snrDB < 15 {
+                lastError = CalibrationMeasurementError.insufficientSNR(
+                    frequency: frequencyHz,
+                    snr: measurement.snrDB
+                )
+                continue
+            }
+            if measurement.stabilityDB > 0.5 {
+                lastError = CalibrationMeasurementError.unstable(
+                    frequency: frequencyHz,
+                    stability: measurement.stabilityDB
+                )
+                continue
+            }
+            return (measurement, signalLevel)
+        }
+        throw lastError
+    }
+
+    private func verifyDevices(outputDeviceUID: String) throws {
+        guard outputMonitor.snapshot().uid == outputDeviceUID else {
+            throw CalibrationMeasurementError.outputDeviceChanged
+        }
+        guard microphone.verifySelectedDeviceIsPresent() else {
+            throw CalibrationMeasurementError.inputDeviceChanged
+        }
+    }
+
+    private func setOrAwaitVolume(
+        _ target: Float,
+        progress: @escaping ProgressHandler
+    ) async throws {
+        if outputMonitor.setVolumeScalar(target) {
+            for _ in 0..<15 {
+                outputMonitor.refresh()
+                try await Task.sleep(for: .milliseconds(100))
+                if let volume = outputMonitor.snapshot().volumeScalar, abs(volume - target) < 0.015 {
+                    return
+                }
+            }
+        }
+
+        progress(CalibrationProgress(
+            message: "请把系统音量调到 \(Int(target * 100))%，检测到后会自动继续",
+            fraction: 0,
+            retry: 0
+        ))
+        for _ in 0..<600 {
+            try Task.checkCancellation()
+            outputMonitor.refresh()
+            try await Task.sleep(for: .milliseconds(100))
+            if let volume = outputMonitor.snapshot().volumeScalar, abs(volume - target) < 0.015 {
+                return
+            }
+        }
+        throw CalibrationMeasurementError.volumeUnavailable(target)
+    }
+}

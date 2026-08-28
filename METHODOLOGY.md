@@ -4,7 +4,7 @@
 
 ## 目标边界
 
-- 实时读取当前系统正在播放的音频电平，而不是读取麦克风。
+- 正常监测只读取当前系统正在播放的音频；麦克风仅在用户主动打开 EM258 校准窗口时按需使用。
 - 保留耳机模型参数，用系统音量上限和实时 RMS 电平估算声压级。
 - 授权一次后应用应稳定运行，不能反复弹权限请求。
 - UI 要能区分“采集中”“无音频”“缺权限”“真实错误”，不能把正常状态误报成异常。
@@ -74,10 +74,10 @@ RMS 是负值，例如 `-20 dBFS` 表示当前内容比满刻度低 20 dB。这�
 验证方法：
 
 ```bash
-rg -n "osascript|AppleScript|ScreenCaptureKit|SCStream|CGRequest|NSScreenCapture|Microphone|AVAudio" .
+rg -n "osascript|AppleScript|ScreenCaptureKit|SCStream|CGRequest|NSScreenCapture" Sources
 ```
 
-搜索结果应为空，说明旧权限触发路径已经清掉。
+搜索结果应为空，说明旧权限触发路径已经清掉。`AVAudioEngine` 现在会出现在独立的 EM258 校准模块中，这是预期行为；日常监测链路仍不打开麦克风。
 
 ## 问题 3：授权一次后仍反复要权限
 
@@ -340,7 +340,7 @@ Signature unchanged
 1. 查代码路径，确认没有旧权限触发源。
 
 ```bash
-rg -n "osascript|AppleScript|ScreenCaptureKit|SCStream|CGRequest|Microphone|AVAudio" .
+rg -n "osascript|AppleScript|ScreenCaptureKit|SCStream|CGRequest|NSScreenCapture" Sources
 ```
 
 2. 查打包后的 plist，而不是只看源码 plist。
@@ -400,3 +400,79 @@ tccutil reset Microphone com.volumemonitor.app
 - 采集失败不等于权限失败，要把无音频、无权限、设备不可用、真实错误分开。
 - 系统音量和系统音频电平是两件事：音量决定上限，RMS 决定实时动态。
 - UI 不应该用高 dB 固定值吓用户；没有音频时就明确显示没有音频。
+
+## EM258 相对声学校准
+
+### 校准能力的物理边界
+
+EM258 的标称灵敏度（例如 `-32 dBV/Pa`）不能和 Mac 麦克风输入的 `dBFS` 直接相加后当作绝对 SPL。TRRS 转接链路、模拟前置放大器、输入增益、ADC 满刻度和设备自动增益都没有经过标定，同一个真实声压在不同输入链路上可能得到不同的 dBFS。
+
+因此当前实现明确分工：
+
+- EM258 实测耳机不同频率的相对响应，以及系统音量变化造成的相对声压变化。
+- 耳机 `sensitivityDBV`、输出端 `maxOutputVRMS` 和既有输出模型继续提供绝对 SPL 基准。
+- UI 始终显示“频响实测、音量曲线实测、绝对 SPL 参数估算”，不会把相对验证误差包装成绝对精度。
+
+### 为什么以 1 kHz 归一化
+
+一次扫频中的麦克风固定增益、前置增益和 ADC 比例对所有频点近似相同。把 1 kHz 的窄带测量设为 `0 dB`，其他频率只保存与它的差值，可以抵消这条未知的固定增益。1 kHz 同时位于常见耳机和麦克风工作带宽的中部，也适合作为音量曲线的固定测试频率。
+
+### 为什么只测 9 个频率点
+
+第一版测量 `63 / 125 / 250 / 500 / 1000 / 2000 / 4000 / 8000 / 12000 Hz`。这组近似倍频程点能覆盖听力安全计算的重要频段，同时把完整测试控制在几十秒。点与点之间在 `log(frequency)` 空间插值，避免把低频的倍频关系和高频的线性 Hz 间隔错误地等同。
+
+每个频点执行：
+
+```text
+静音测底噪 → 淡入 → 等待稳定 → 窄带测量 → 质量判断 → 淡出
+```
+
+目标频率能量使用 Hann 窗 Goertzel 分析。输入峰值高于 `-3 dBFS` 时降低测试音并只重测当前点；SNR 低于 `15 dB` 或测量标准差高于 `0.5 dB` 时也只重测当前点，最多两次，不清空已经通过的频点。
+
+若安全控制或削波重测使某一点使用了更低的数字测试电平，保存相对结果前会先计算 `microphoneLevelDBFS - actualSignalRMSDBFS`。因此降低测试电平不会被误认为耳机响应变低，也不需要清空已经通过的点。
+
+### 为什么音量曲线只测 30%、50%、70%
+
+音量测试固定使用 1 kHz 和相同数字 RMS，记录三个系统音量相对于 50% 的实测变化。三点足以替换原先完全经验化的音量曲线，同时不会让用户执行冗长测试。30% 到 70% 内单调线性插值；范围外按边缘斜率有限外推，并限制异常值。
+
+绝对基准仍按下式计算：
+
+```text
+referenceFullScaleSPLAt50 = existingHeadphoneModel(volume: 50%)
+fullScaleSPL(v) = referenceFullScaleSPLAt50 + measuredVolumeDelta(v)
+estimatedSPL = fullScaleSPL(v) + calibratedAWeightedRMSDBFS
+```
+
+### FFT 如何应用耳机频响和 A weighting
+
+运行时使用 4096 点 Hann 窗、50% overlap，并对左右声道分别做 Accelerate/vDSP FFT。每个频率 bin 的功率依次乘以：
+
+```text
+10^(headphoneResponseDB / 10)
+×
+10^(AWeightingDB / 10)
+```
+
+之后在功率域求和，再开平方得到 RMS。左右声道取较响一侧，避免一个耳朵较响时被立体声平均掩盖。FFT 归一化通过实际窗后时域能量和频域能量比完成，不使用硬编码 offset。零耳机频响曲线已用 100 Hz、1 kHz、4 kHz、10 kHz 正弦与原 `AWeightingMeter` 对照，误差门限为 `< 0.5 dB`。
+
+原 `AWeightingMeter` 没有删除。配置缺失、版本不兼容、设备 UID 不匹配、频点缺失、数值非有限或 FFT 尚未产出结果时，整条链路回退到原来的 A-weighting、经验音量曲线和耳机绝对参数模型。
+
+### 权限和生命周期
+
+`NSAudioCaptureUsageDescription` 继续对应日常 CoreAudio 系统音频 tap。`NSMicrophoneUsageDescription` 只对应 EM258 校准：第一次进入校准窗口才申请，关闭窗口、取消、保存、报错或退出 App 时立即停止麦克风和测试音。校准结束后日常使用不需要连接 EM258。
+
+### 配置文件
+
+校准配置保存在：
+
+```text
+~/Library/Application Support/VolumeMonitor/calibration-profiles.json
+```
+
+文件为带 schema/version 的可读 JSON，可保存多套“耳机档案 ID + 输出设备 UID”组合。损坏文件不会使 App 崩溃。更换输出设备不会套用旧校准。
+
+在“设置与档案”中的“EM258 相对校准”区域点击“删除当前校准并恢复标准估算”，即可回到未校准模式；这个操作不删除耳机参数档案和声暴露历史。
+
+### 将来加入 94 dB 声学校准器
+
+数据模型已预留 `absoluteCalibrationMode.acousticReference`，但当前版本拒绝保存该模式，避免伪造绝对精度。将来需要新增一个独立的 94 dB 参考步骤：固定输入设备、输入增益和完整转接链路，测得 `94 dB SPL → microphone dBFS` 的绝对 offset，并把参考设备、日期和输入链路写入配置。随后才能让运行时用声学参考替换耳机参数绝对基准；频响、音量曲线和 FFT 管线本身无需重写。
