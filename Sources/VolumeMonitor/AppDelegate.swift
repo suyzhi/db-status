@@ -65,12 +65,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         calibrationWindowController?.stopCalibration()
     }
 
-    @objc private func togglePopover() {
+    @objc private func togglePopover(_ sender: Any?) {
         if popover.isShown {
             popover.performClose(nil)
             return
         }
-        showPopover()
+        showPopover(relativeTo: sender as? NSView)
     }
 
     func applicationShouldHandleReopen(
@@ -81,9 +81,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func showPopover() {
+    private func showPopover(relativeTo anchorView: NSView? = nil) {
         refreshData()
-        guard let button = statusItem.button else { return }
+        guard let button = anchorView ?? statusItem.button else { return }
         NSApplication.shared.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
@@ -138,10 +138,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: 48)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         guard let button = statusItem.button else { return }
-        button.image = createStatusBarIcon(text: "--", color: .systemGray)
-        button.action = #selector(togglePopover)
+        button.image = statusBarSymbol()
+        button.imagePosition = .imageLeading
+        button.imageScaling = .scaleProportionallyDown
+        button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        button.title = "--"
+        button.contentTintColor = .secondaryLabelColor
+        button.action = #selector(togglePopover(_:))
         button.target = self
         button.toolTip = "听力暴露监测"
     }
@@ -153,7 +158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard text != lastStatusBarText || colorKey != lastStatusBarColorKey else { return }
         lastStatusBarText = text
         lastStatusBarColorKey = colorKey
-        statusItem.button?.image = createStatusBarIcon(text: text, color: color)
+        statusItem.button?.title = text
+        statusItem.button?.contentTintColor = color
         switch preferences.statusBarDisplayMode {
         case .estimatedDBA:
             statusItem.button?.toolTip = text == "--" ? "当前无可信 dBA 估算" : "实时估算 ≈\(text) dBA"
@@ -164,19 +170,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func createStatusBarIcon(text: String, color: NSColor) -> NSImage {
-        let image = NSImage(size: NSSize(width: 44, height: 18))
-        image.lockFocus()
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold),
-            .foregroundColor: NSColor.labelColor
-        ]
-        let textSize = text.size(withAttributes: attributes)
-        text.draw(at: NSPoint(x: max(1, 35 - textSize.width), y: 0), withAttributes: attributes)
-        color.setFill()
-        NSBezierPath(ovalIn: NSRect(x: 38, y: 6, width: 5, height: 5)).fill()
-        image.unlockFocus()
-        image.isTemplate = false
+    private func statusBarSymbol() -> NSImage? {
+        let configuration = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        let image = NSImage(
+            systemSymbolName: "ear",
+            accessibilityDescription: "听力暴露监测"
+        )?.withSymbolConfiguration(configuration)
+        image?.isTemplate = true
         return image
     }
 
