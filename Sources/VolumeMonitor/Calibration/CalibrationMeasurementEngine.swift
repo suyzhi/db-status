@@ -196,6 +196,7 @@ final class CalibrationMeasurementEngine {
     func measureVolumeCurve(
         outputDeviceUID: String,
         testSignalRMSDBFS: Double,
+        maxSignalAtVolume: ((Float) -> Double?)? = nil,
         progress: @escaping ProgressHandler
     ) async throws -> VolumeSweepResult {
         let originalVolume = outputMonitor.snapshot().volumeScalar
@@ -224,6 +225,7 @@ final class CalibrationMeasurementEngine {
             let result = try await measureWithRetries(
                 frequencyHz: 1_000,
                 initialRMSDBFS: currentLevel,
+                maxSignalRMSDBFS: maxSignalAtVolume?(volume),
                 outputDeviceUID: outputDeviceUID,
                 baseFraction: Double(index) / 3,
                 progress: progress
@@ -319,12 +321,13 @@ final class CalibrationMeasurementEngine {
     ) async throws -> (measurement: CalibrationFrequencyMeasurement, usedSignalRMSDBFS: Double) {
         var signalLevel = initialRMSDBFS
         var lastError: Error = CalibrationMeasurementError.noMeasurement(frequencyHz)
-        // SNR 不足时不再逐级 +3 dB 爬升——直接一步提到封顶电平重测（最多重测 2 次），
-        // 省去低频点反复失败的等待。封顶 = min(初始+12 dB, 90 dBA 换算的电平上限)；
-        // 削波保护仍会立即回退。
+        // SNR 不足时直接一步提到封顶电平重测（最多重测 2 次）。
+        // 封顶 = 调用方提供的模型上限（按当前音量换算的 90 dBA，权威值）；
+        // 未提供时退化为 初始+12 dB。数字电平再钳制在 -6 dBFS 以下
+        // （保留正弦峰值余量），且不低于初始电平。削波保护仍会回退。
         let relativeCapDB = 12.0
-        let ceiling = maxSignalRMSDBFS.map { min($0, initialRMSDBFS + relativeCapDB) }
-            ?? initialRMSDBFS + relativeCapDB
+        let requestedCap = maxSignalRMSDBFS ?? (initialRMSDBFS + relativeCapDB)
+        let ceiling = max(initialRMSDBFS, min(requestedCap, -6.0))
         var jumpedToMax = false
         for attempt in 0...2 {
             try Task.checkCancellation()
@@ -372,7 +375,7 @@ final class CalibrationMeasurementEngine {
                 signalLevel -= 4
                 continue
             }
-            if measurement.snrDB < 15 {
+            if measurement.snrDB < 12 {
                 lastError = CalibrationMeasurementError.insufficientSNR(
                     frequency: frequencyHz,
                     snr: measurement.snrDB

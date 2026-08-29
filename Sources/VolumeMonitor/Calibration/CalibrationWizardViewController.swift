@@ -192,7 +192,10 @@ final class CalibrationWizardViewModel: ObservableObject {
     }
 
     func beginVolumeTest() {
-        guard let uid = outputDevice.uid, let frequencyResult else { return }
+        guard let uid = outputDevice.uid,
+              let frequencyResult,
+              let sensitivity = headphoneProfile?.sensitivity?.dbPerVolt,
+              let source = headphoneProfile?.outputSource else { return }
         activeTask?.cancel()
         activeTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -200,9 +203,20 @@ final class CalibrationWizardViewModel: ObservableObject {
             errorMessage = ""
             defer { isBusy = false }
             do {
+                // 30% 等低音量点的声压比 50% 低一截；若沿用 50% 的封顶，
+                // 测试音往往连环境噪声都压不过。这里按“当前音量”换算
+                // 90 dBA 模型封顶（数字电平另有 -6 dBFS 钳制），让低音量点
+                // 也有足够响的测试音，而不必要求环境绝对安静。
                 volumeResult = try await measurementEngine.measureVolumeCurve(
                     outputDeviceUID: uid,
                     testSignalRMSDBFS: frequencyResult.testSignalRMSDBFS,
+                    maxSignalAtVolume: { volume in
+                        LevelEstimator.headphoneModelFullScaleDBA(
+                            at: volume,
+                            sensitivityDBV: sensitivity,
+                            source: source
+                        ).map { CalibrationToneGenerator.maximumCalibrationToneDBA - Double($0) }
+                    },
                     progress: updateProgress
                 )
                 step = .validation
