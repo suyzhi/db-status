@@ -69,7 +69,7 @@ enum CalibrationMeasurementError: LocalizedError {
         case .noMeasurement(let frequency): "\(Int(frequency)) Hz 没有获得足够的麦克风数据"
         case .clipping(let frequency): "\(Int(frequency)) Hz 测量时麦克风输入接近削波"
         case .insufficientSNR(let frequency, let snr):
-            "\(Int(frequency)) Hz 信噪比不足（\(String(format: "%.1f", snr)) dB）。已自动提高测试音量重试；仍不足时请重点检查：① EM258 与耳机贴合密封是否足够（低频最怕漏气）；② 关闭风扇/空调等低频噪声源；③ 环境安静后点击「仅重测当前阶段」"
+            "\(Int(frequency)) Hz 信噪比不足（\(String(format: "%.1f", snr)) dB）。已自动提高测试音量重试（受安全上限约束）；仍不足时请重点检查：① 环境噪声——关闭风扇/空调/其它播放（开放式耳罩双向透声，噪声最容易混入低频测量）；② 探头位置——EM258 尽量贴近耳机单元中心并保持稳定（开放式大耳低频对探头位置敏感）；③ 保持耳机和探头不动后点击「仅重测当前阶段」"
         case .unstable(let frequency, let stability):
             "\(Int(frequency)) Hz 测量不稳定（\(String(format: "%.2f", stability)) dB）"
         }
@@ -102,6 +102,7 @@ final class CalibrationMeasurementEngine {
     func measureFrequencyResponse(
         outputDeviceUID: String,
         testSignalRMSDBFS: Double,
+        maxSignalRMSDBFS: Double? = nil,
         progress: @escaping ProgressHandler
     ) async throws -> FrequencySweepResult {
         let originalVolume = outputMonitor.snapshot().volumeScalar
@@ -122,6 +123,7 @@ final class CalibrationMeasurementEngine {
             let result = try await measureWithRetries(
                 frequencyHz: frequency,
                 initialRMSDBFS: currentLevel,
+                maxSignalRMSDBFS: maxSignalRMSDBFS,
                 outputDeviceUID: outputDeviceUID,
                 baseFraction: fraction,
                 progress: progress
@@ -277,20 +279,23 @@ final class CalibrationMeasurementEngine {
     private func measureWithRetries(
         frequencyHz: Double,
         initialRMSDBFS: Double,
+        maxSignalRMSDBFS: Double? = nil,
         outputDeviceUID: String,
         baseFraction: Double,
         progress: @escaping ProgressHandler
     ) async throws -> (measurement: CalibrationFrequencyMeasurement, usedSignalRMSDBFS: Double) {
         var signalLevel = initialRMSDBFS
         var lastError: Error = CalibrationMeasurementError.noMeasurement(frequencyHz)
-        // 低频点（尤其 63/125 Hz）受耳机频响跌落与密封影响，同电平 SNR 可能不足；
-        // 每次因 SNR 失败自动 +3 dB，最多 +9 dB（仍受 84 dBA 安全上限约束，
-        // 且削波保护会立即回退），而不是原地重复相同电平。
+        // 低频点（尤其 63/125/250 Hz）受耳机频响跌落、密封透声与环境噪声影响，
+        // 同电平 SNR 可能不足；每次因 SNR 失败自动 +3 dB（最多 +9 dB），
+        // 且绝不越过 maxSignalRMSDBFS（84 dBA 安全上限换算的电平封顶），
+        // 削波保护会立即回退——而不是原地重复相同电平。
         let boostStepDB = 3.0
-        let maxBoostDB = 9.0
-        for attempt in 0...3 {
+        let boostAttempts = 3
+        for attempt in 0...boostAttempts {
             try Task.checkCancellation()
-            let label = attempt == 0 ? "" : "（自动重测 \(attempt)/3\(attempt > 0 && signalLevel > initialRMSDBFS ? "，已提高电平" : "")）"
+            let boosted = attempt > 0 && signalLevel > initialRMSDBFS
+            let label = attempt == 0 ? "" : "（自动重测 \(attempt)/\(boostAttempts)\(boosted ? "，已提高电平" : "")）"
             progress(CalibrationProgress(
                 message: "测量 \(Int(frequencyHz)) Hz\(label)",
                 fraction: min(0.99, baseFraction),
@@ -339,7 +344,8 @@ final class CalibrationMeasurementEngine {
                     frequency: frequencyHz,
                     snr: measurement.snrDB
                 )
-                guard signalLevel + boostStepDB <= initialRMSDBFS + maxBoostDB else { continue }
+                let ceiling = maxSignalRMSDBFS.map { min($0, initialRMSDBFS + 9) } ?? initialRMSDBFS + 9
+                guard signalLevel + boostStepDB <= ceiling else { continue }
                 signalLevel += boostStepDB
                 continue
             }

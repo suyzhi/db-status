@@ -171,9 +171,12 @@ final class CalibrationWizardViewModel: ObservableObject {
                 let safeLevel = try CalibrationToneGenerator.safeRMSDBFS(
                     estimatedFullScaleDBA: fullScale
                 )
+                // 安全封顶：即使自动提高电平，也不让预测声压越过 84 dBA。
+                let maxSignal = fullScale.map { 84 - Double($0) }
                 frequencyResult = try await measurementEngine.measureFrequencyResponse(
                     outputDeviceUID: uid,
                     testSignalRMSDBFS: safeLevel,
+                    maxSignalRMSDBFS: maxSignal,
                     progress: updateProgress
                 )
                 step = .volume
