@@ -347,9 +347,10 @@ import Testing
             requested: -35,
             estimatedFullScaleDBA: 100
         ) == -35)
+        // 90 dBA 上限：满刻度 131 dBA 时压到 -41 dBFS，使声压恰好 90 dBA。
         #expect(try CalibrationToneGenerator.safeRMSDBFS(
             requested: -35,
-            estimatedFullScaleDBA: 125
+            estimatedFullScaleDBA: 131
         ) == -41)
         #expect(try CalibrationToneGenerator.safeRMSDBFS(
             requested: -35,

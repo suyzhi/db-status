@@ -171,8 +171,10 @@ final class CalibrationWizardViewModel: ObservableObject {
                 let safeLevel = try CalibrationToneGenerator.safeRMSDBFS(
                     estimatedFullScaleDBA: fullScale
                 )
-                // 安全封顶：即使自动提高电平，也不让预测声压越过 84 dBA。
-                let maxSignal = fullScale.map { 84 - Double($0) }
+                // 安全封顶：即使自动提高电平，也不让预测声压越过 90 dBA 上限。
+                let maxSignal = fullScale.map {
+                    CalibrationToneGenerator.maximumCalibrationToneDBA - Double($0)
+                }
                 frequencyResult = try await measurementEngine.measureFrequencyResponse(
                     outputDeviceUID: uid,
                     testSignalRMSDBFS: safeLevel,
@@ -513,7 +515,7 @@ private struct InstallationCalibrationStep: View {
                 Label("耳垫完整密封", systemImage: "checkmark.circle.fill")
                 Label("后续测试不要移动耳机", systemImage: "checkmark.circle.fill")
             }.foregroundStyle(.green)
-            Text("测试会从低电平淡入，并按耳机参数限制在估算 84 dBA 以下。")
+            Text("测试会从低电平淡入，并按耳机参数限制在估算 90 dBA 以下（短时校准音）。")
                 .font(.caption).foregroundStyle(.secondary)
             Button("我已固定完成") {
                 viewModel.step = .frequency

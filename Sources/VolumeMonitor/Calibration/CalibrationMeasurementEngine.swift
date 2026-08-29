@@ -82,7 +82,7 @@ enum CalibrationMeasurementError: LocalizedError {
         case .noMeasurement(let frequency): "\(Int(frequency)) Hz 没有获得足够的麦克风数据"
         case .clipping(let frequency): "\(Int(frequency)) Hz 测量时麦克风输入接近削波"
         case .insufficientSNR(let frequency, let snr):
-            "\(Int(frequency)) Hz 信噪比不足（\(String(format: "%.1f", snr)) dB）。已自动提高测试音量重试（受安全上限约束）；仍不足时请重点检查：① 环境噪声——关闭风扇/空调/其它播放（开放式耳罩双向透声，噪声最容易混入低频测量）；② 探头位置——EM258 尽量贴近耳机单元中心并保持稳定（开放式大耳低频对探头位置敏感）；③ 保持耳机和探头不动后点击「仅重测当前阶段」"
+            "\(Int(frequency)) Hz 信噪比不足（\(String(format: "%.1f", snr)) dB）。已自动提高到封顶电平重试；仍不足时请重点检查：① 环境噪声——关闭风扇/空调/其它播放（开放式耳罩双向透声，噪声最容易混入低频测量）；② 探头位置——EM258 尽量贴近耳机单元中心并保持稳定（开放式大耳低频对探头位置敏感）；③ 保持耳机和探头不动后点击「仅重测当前阶段」"
         case .unstable(let frequency, let stability):
             "\(Int(frequency)) Hz 测量不稳定（\(String(format: "%.2f", stability)) dB）"
         }
@@ -319,16 +319,16 @@ final class CalibrationMeasurementEngine {
     ) async throws -> (measurement: CalibrationFrequencyMeasurement, usedSignalRMSDBFS: Double) {
         var signalLevel = initialRMSDBFS
         var lastError: Error = CalibrationMeasurementError.noMeasurement(frequencyHz)
-        // 低频点（尤其 63/125/250 Hz）受耳机频响跌落、密封透声与环境噪声影响，
-        // 同电平 SNR 可能不足；每次因 SNR 失败自动 +3 dB（最多 +9 dB），
-        // 且绝不越过 maxSignalRMSDBFS（84 dBA 安全上限换算的电平封顶），
-        // 削波保护会立即回退——而不是原地重复相同电平。
-        let boostStepDB = 3.0
-        let boostAttempts = 3
-        for attempt in 0...boostAttempts {
+        // SNR 不足时不再逐级 +3 dB 爬升——直接一步提到封顶电平重测（最多重测 2 次），
+        // 省去低频点反复失败的等待。封顶 = min(初始+12 dB, 90 dBA 换算的电平上限)；
+        // 削波保护仍会立即回退。
+        let relativeCapDB = 12.0
+        let ceiling = maxSignalRMSDBFS.map { min($0, initialRMSDBFS + relativeCapDB) }
+            ?? initialRMSDBFS + relativeCapDB
+        var jumpedToMax = false
+        for attempt in 0...2 {
             try Task.checkCancellation()
-            let boosted = attempt > 0 && signalLevel > initialRMSDBFS
-            let label = attempt == 0 ? "" : "（自动重测 \(attempt)/\(boostAttempts)\(boosted ? "，已提高电平" : "")）"
+            let label = attempt == 0 ? "" : "（自动提高到封顶电平重测 \(attempt)/2）"
             progress(CalibrationProgress(
                 message: "测量 \(Int(frequencyHz)) Hz\(label)",
                 fraction: min(0.99, baseFraction),
@@ -377,9 +377,11 @@ final class CalibrationMeasurementEngine {
                     frequency: frequencyHz,
                     snr: measurement.snrDB
                 )
-                let ceiling = maxSignalRMSDBFS.map { min($0, initialRMSDBFS + 9) } ?? initialRMSDBFS + 9
-                guard signalLevel + boostStepDB <= ceiling else { continue }
-                signalLevel += boostStepDB
+                if !jumpedToMax && ceiling > signalLevel {
+                    signalLevel = ceiling
+                    jumpedToMax = true
+                    continue
+                }
                 continue
             }
             if measurement.stabilityDB > 0.5 {

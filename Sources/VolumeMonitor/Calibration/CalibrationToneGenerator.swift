@@ -25,6 +25,11 @@ final class CalibrationToneGenerator {
         engine.attach(player)
     }
 
+    /// 校准测试音的声压安全上限（仅在校准过程中出现，单点几秒、总计一两分钟）。
+    /// 90 dBA 对短时暴露是安全的；此前用 84 dBA 偏保守，开放式大耳高频/低频点
+    /// 输出低，加上上限后常常够不到 15 dB 信噪比门槛。
+    nonisolated static let maximumCalibrationToneDBA: Double = 90
+
     nonisolated static func safeRMSDBFS(
         requested: Double = -35,
         estimatedFullScaleDBA: Float?
@@ -32,7 +37,7 @@ final class CalibrationToneGenerator {
         guard let estimatedFullScaleDBA, estimatedFullScaleDBA.isFinite else {
             return min(requested, -45)
         }
-        let safe = min(requested, 84 - Double(estimatedFullScaleDBA))
+        let safe = min(requested, maximumCalibrationToneDBA - Double(estimatedFullScaleDBA))
         guard safe >= -70 else { throw CalibrationToneError.unsafeRequiredLevel }
         return safe
     }
