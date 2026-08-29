@@ -230,6 +230,31 @@ import Testing
     }
 
     @MainActor
+    @Test func frequencyValidationAcceptsSkippedTopPointsButRequiresMandatoryBand() {
+        let base = makeValidProfile(headphoneProfileID: UUID(), outputUID: "output-skip")
+
+        // 跳过 12 kHz（开放式大耳高频不足时允许）——仍应有效。
+        var skippedTop = base
+        skippedTop.frequencyPoints = base.frequencyPoints.filter { abs($0.frequencyHz - 12_000) >= 0.5 }
+        #expect(skippedTop.frequencyValidationIssue == nil)
+
+        // 同时跳过 8 kHz 与 12 kHz（7 个必备频点）——仍应有效。
+        var skippedBoth = base
+        skippedBoth.frequencyPoints = base.frequencyPoints.filter { $0.frequencyHz < 8_000 }
+        #expect(skippedBoth.frequencyValidationIssue == nil)
+
+        // 跳过 63 Hz（必备频段）——应判无效。
+        var missingBass = base
+        missingBass.frequencyPoints = base.frequencyPoints.filter { abs($0.frequencyHz - 63) >= 0.5 }
+        #expect(missingBass.frequencyValidationIssue != nil)
+
+        // 只留 6 个点——应判无效。
+        var tooFew = base
+        tooFew.frequencyPoints = Array(base.frequencyPoints.prefix(6))
+        #expect(tooFew.frequencyValidationIssue != nil)
+    }
+
+    @MainActor
     @Test func calibrationSaveLoadRoundTripAndMultipleHeadphones() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

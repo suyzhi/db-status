@@ -250,9 +250,23 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
             $0.measuredLevelDBFS?.isFinite != false
         }) else { return "频率校准包含无效数值" }
         let sorted = frequencyPoints.sorted { $0.frequencyHz < $1.frequencyHz }
-        guard sorted.count == Self.requiredFrequenciesHz.count else { return "频率点数量不完整" }
-        for (actual, expected) in zip(sorted.map(\.frequencyHz), Self.requiredFrequenciesHz) {
-            guard abs(actual - expected) < 0.5 else { return "缺少 \(Int(expected)) Hz 频率点" }
+        guard zip(sorted, sorted.dropFirst()).allSatisfy({ $0.frequencyHz < $1.frequencyHz }) else {
+            return "频率点重复"
+        }
+        // 必备频段：63 Hz ~ 4 kHz（听力安全的主频段）。8/12 kHz 属可选——
+        // 开放式大耳等设备高频输出不足时允许跳过（测量端已完成电平补偿
+        // 与多轮重试），曲线在最后一个有效频点处按该点值延伸。
+        let mandatory: [Double] = [63, 125, 250, 500, 1_000, 2_000, 4_000]
+        guard sorted.count >= mandatory.count,
+              sorted.allSatisfy({ point in
+                  Self.requiredFrequenciesHz.contains { abs($0 - point.frequencyHz) < 0.5 }
+              }) else {
+            return "频率点数量不足或包含未定义频点"
+        }
+        for expected in mandatory {
+            guard sorted.contains(where: { abs($0.frequencyHz - expected) < 0.5 }) else {
+                return "缺少 \(Int(expected)) Hz 频率点"
+            }
         }
         guard let reference = sorted.first(where: { abs($0.frequencyHz - 1_000) < 0.5 }),
               abs(reference.relativeDB) <= 0.2 else {

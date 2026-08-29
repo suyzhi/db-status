@@ -177,6 +177,7 @@ final class CalibrationWizardViewModel: ObservableObject {
                     outputDeviceUID: uid,
                     testSignalRMSDBFS: safeLevel,
                     maxSignalRMSDBFS: maxSignal,
+                    allowSkipTopFrequencies: true,
                     progress: updateProgress
                 )
                 step = .volume
@@ -526,7 +527,7 @@ private struct FrequencyCalibrationStep: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("自动频响测试").font(.title2.bold())
-            Text("系统将在 50% 音量依次测量 63 Hz 到 12 kHz 的 9 个频点，约需几十秒。")
+            Text("系统将在 50% 音量依次测量 63 Hz 到 12 kHz 的 9 个频点，约需几十秒。若 8/12 kHz 信噪比仍不足，会自动跳过并以 4 kHz 附近的点截止，不影响主频段校准。")
             Text("每个频点都会淡入、等待稳定、测量并淡出；噪声、削波或不稳定只会重测当前点。")
                 .font(.callout).foregroundStyle(.secondary)
             Button(viewModel.isBusy ? "测试中…" : "开始自动测试") {

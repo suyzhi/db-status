@@ -34,6 +34,19 @@ struct FrequencySweepResult: Sendable, Equatable {
     let points: [FrequencyCalibrationPoint]
     let minimumSNRDB: Double
     let testSignalRMSDBFS: Double
+    let skippedFrequencies: [Double]
+
+    init(
+        points: [FrequencyCalibrationPoint],
+        minimumSNRDB: Double,
+        testSignalRMSDBFS: Double,
+        skippedFrequencies: [Double] = []
+    ) {
+        self.points = points
+        self.minimumSNRDB = minimumSNRDB
+        self.testSignalRMSDBFS = testSignalRMSDBFS
+        self.skippedFrequencies = skippedFrequencies
+    }
 }
 
 struct VolumeSweepResult: Sendable, Equatable {
@@ -103,6 +116,7 @@ final class CalibrationMeasurementEngine {
         outputDeviceUID: String,
         testSignalRMSDBFS: Double,
         maxSignalRMSDBFS: Double? = nil,
+        allowSkipTopFrequencies: Bool = false,
         progress: @escaping ProgressHandler
     ) async throws -> FrequencySweepResult {
         let originalVolume = outputMonitor.snapshot().volumeScalar
@@ -115,23 +129,38 @@ final class CalibrationMeasurementEngine {
         try await setOrAwaitVolume(0.5, outputDeviceUID: outputDeviceUID, progress: progress)
 
         var measurements: [(measurement: CalibrationFrequencyMeasurement, signalRMSDBFS: Double)] = []
+        var skipped: [Double] = []
         var currentLevel = testSignalRMSDBFS
         for (index, frequency) in CalibrationProfile.requiredFrequenciesHz.enumerated() {
             try Task.checkCancellation()
             try verifyDevices(outputDeviceUID: outputDeviceUID)
             let fraction = Double(index) / Double(CalibrationProfile.requiredFrequenciesHz.count)
-            let result = try await measureWithRetries(
-                frequencyHz: frequency,
-                initialRMSDBFS: currentLevel,
-                maxSignalRMSDBFS: maxSignalRMSDBFS,
-                outputDeviceUID: outputDeviceUID,
-                baseFraction: fraction,
-                progress: progress
-            )
-            currentLevel = min(currentLevel, result.usedSignalRMSDBFS)
-            measurements.append((result.measurement, result.usedSignalRMSDBFS))
+            do {
+                let result = try await measureWithRetries(
+                    frequencyHz: frequency,
+                    initialRMSDBFS: currentLevel,
+                    maxSignalRMSDBFS: maxSignalRMSDBFS,
+                    outputDeviceUID: outputDeviceUID,
+                    baseFraction: fraction,
+                    progress: progress
+                )
+                currentLevel = min(currentLevel, result.usedSignalRMSDBFS)
+                measurements.append((result.measurement, result.usedSignalRMSDBFS))
+            } catch CalibrationMeasurementError.insufficientSNR
+                where allowSkipTopFrequencies && frequency >= 8_000 {
+                // 8/12 kHz 是开放式大耳最常出现的低频响点；A 加权暴露中该频段贡献很小，
+                // 跳过并以最后一个有效点（≤8 kHz）截止是合理兜底。
+                skipped.append(frequency)
+                progress(CalibrationProgress(
+                    message: "\(Int(frequency)) Hz 信噪比不足，已跳过（曲线将在该点上方截止）",
+                    fraction: min(0.99, fraction + 0.04),
+                    retry: 0
+                ))
+            }
         }
-
+        if measurements.count < 7 {
+            throw CalibrationMeasurementError.noMeasurement(1_000)
+        }
         guard let reference = measurements.first(where: {
             abs($0.measurement.frequencyHz - 1_000) < 0.5
         }) else {
@@ -152,11 +181,15 @@ final class CalibrationMeasurementEngine {
                 measuredLevelDBFS: item.measurement.levelDBFS
             )
         }
-        progress(CalibrationProgress(message: "9 个频率点测量完成", fraction: 1, retry: 0))
+        let summary = skipped.isEmpty
+            ? "9 个频率点测量完成"
+            : "\(points.count) 个频率点测量完成（已跳过：\(skipped.map { "\(Int($0)) Hz" }.joined(separator: "、"))；\(Int(points.map(\.frequencyHz).max() ?? 0)) Hz 以上按该点值延伸）"
+        progress(CalibrationProgress(message: summary, fraction: 1, retry: 0))
         return FrequencySweepResult(
             points: points,
             minimumSNRDB: measurements.map(\.measurement.snrDB).min() ?? 0,
-            testSignalRMSDBFS: currentLevel
+            testSignalRMSDBFS: currentLevel,
+            skippedFrequencies: skipped
         )
     }
 
