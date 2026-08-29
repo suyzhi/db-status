@@ -10,6 +10,7 @@ struct CalibrationInputDevice: Sendable, Equatable, Identifiable {
 
     var isExternal: Bool {
         transportType != kAudioDeviceTransportTypeBuiltIn
+            && transportType != kAudioDeviceTransportTypeVirtual
     }
 }
 
@@ -20,6 +21,23 @@ enum CalibrationMicrophoneStatus: Sendable, Equatable {
     case noPermission
     case deviceChanged
     case failed(String)
+}
+
+enum CalibrationInputFormatValidator {
+    static let maximumSupportedChannelCount: UInt32 = 32
+
+    static func isValid(
+        sampleRate: Double,
+        channelCount: UInt32,
+        isStandardPCM: Bool
+    ) -> Bool {
+        sampleRate.isFinite
+            && sampleRate > 0
+            && sampleRate <= 768_000
+            && channelCount > 0
+            && channelCount <= maximumSupportedChannelCount
+            && isStandardPCM
+    }
 }
 
 struct CalibrationMicrophoneSnapshot: Sendable, Equatable {
@@ -176,11 +194,12 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
         tapDetected: false
     )
 
-    private let engine = AVAudioEngine()
+    private var engine: AVAudioEngine?
     private nonisolated let captureState = MicrophoneCaptureState()
     private var selectedDevice: CalibrationInputDevice?
     private var updateTimer: Timer?
     private var tapInstalled = false
+    private var captureAttemptID: UUID?
     private(set) var inputChainFingerprint: CalibrationInputChainFingerprint?
 
     func refreshDevices() {
@@ -195,10 +214,19 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
         devices.first(where: \.isExternal) ?? devices.first
     }
 
+    func select(device: CalibrationInputDevice) {
+        stop()
+        selectedDevice = device
+        publishSnapshot()
+    }
+
     func start(device: CalibrationInputDevice) async {
         stop()
         selectedDevice = device
+        let attemptID = UUID()
+        captureAttemptID = attemptID
         setStatus(.requestingPermission)
+        publishSnapshot()
         let granted: Bool
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -208,6 +236,9 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
         default:
             granted = false
         }
+        guard !Task.isCancelled,
+              captureAttemptID == attemptID,
+              selectedDevice?.uid == device.uid else { return }
         guard granted else {
             setStatus(.noPermission)
             publishSnapshot()
@@ -230,6 +261,7 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
     }
 
     func stop() {
+        captureAttemptID = nil
         updateTimer?.invalidate()
         updateTimer = nil
         stopEngineOnly()
@@ -302,6 +334,9 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
     }
 
     private func configureEngine(device: CalibrationInputDevice) throws {
+        stopEngineOnly()
+        let engine = AVAudioEngine()
+        self.engine = engine
         let inputNode = engine.inputNode
         guard let audioUnit = inputNode.audioUnit else {
             throw NSError(
@@ -327,16 +362,65 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
             )
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self] buffer, _ in
-            self?.process(buffer)
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        let stream = inputFormat.streamDescription.pointee
+        let standardPCM = inputFormat.isStandard
+            && stream.mFormatID == kAudioFormatLinearPCM
+            && stream.mBytesPerFrame > 0
+            && stream.mBitsPerChannel > 0
+        NSLog(
+            "[CalibrationMicrophone] device=%@ id=%u setResult=%d sampleRate=%.1f channels=%u standardPCM=%@",
+            device.uid,
+            device.id,
+            setResult,
+            inputFormat.sampleRate,
+            inputFormat.channelCount,
+            standardPCM ? "yes" : "no"
+        )
+        guard CalibrationInputFormatValidator.isValid(
+            sampleRate: inputFormat.sampleRate,
+            channelCount: inputFormat.channelCount,
+            isStandardPCM: standardPCM
+        ) else {
+            throw NSError(
+                domain: "VolumeMonitor.CalibrationMicrophone",
+                code: 3,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "输入设备格式不可用（\(inputFormat.sampleRate) Hz，\(inputFormat.channelCount) 声道）"
+                ]
+            )
         }
+
+        if tapInstalled {
+            inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        let tapBlock = Self.makeTapBlock(captureState: captureState)
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: 1_024,
+            format: inputFormat,
+            block: tapBlock
+        )
         tapInstalled = true
         engine.prepare()
         try engine.start()
-        inputChainFingerprint = makeInputChainFingerprint(device: device, format: inputNode.outputFormat(forBus: 0))
+        inputChainFingerprint = makeInputChainFingerprint(device: device, format: inputFormat)
     }
 
-    nonisolated private func process(_ buffer: AVAudioPCMBuffer) {
+    nonisolated private static func makeTapBlock(
+        captureState: MicrophoneCaptureState
+    ) -> AVAudioNodeTapBlock {
+        { buffer, _ in
+            process(buffer, captureState: captureState)
+        }
+    }
+
+    nonisolated private static func process(
+        _ buffer: AVAudioPCMBuffer,
+        captureState: MicrophoneCaptureState
+    ) {
         guard let channels = buffer.floatChannelData else { return }
         let channelCount = Int(buffer.format.channelCount)
         let frameCount = Int(buffer.frameLength)
@@ -433,12 +517,17 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
     }
 
     private func stopEngineOnly() {
+        guard let engine else {
+            tapInstalled = false
+            return
+        }
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
         engine.stop()
         engine.reset()
+        self.engine = nil
     }
 
     nonisolated private static func dbFS(_ linear: Double) -> Double {
@@ -451,7 +540,7 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
     }
 
     private func currentInputChainFingerprint() -> CalibrationInputChainFingerprint? {
-        guard let selectedDevice else { return nil }
+        guard let selectedDevice, let engine else { return nil }
         return makeInputChainFingerprint(
             device: selectedDevice,
             format: engine.inputNode.outputFormat(forBus: 0)

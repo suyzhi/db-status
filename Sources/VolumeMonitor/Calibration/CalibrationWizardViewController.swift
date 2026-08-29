@@ -20,6 +20,14 @@ enum CalibrationWizardStep: Int, CaseIterable {
     }
 }
 
+enum CalibrationMicrophoneStartTrigger: Sendable, Equatable {
+    case windowPreparation
+    case deviceSelection
+    case manualDetectionButton
+
+    var startsCapture: Bool { self == .manualDetectionButton }
+}
+
 @MainActor
 final class CalibrationWizardViewModel: ObservableObject {
     @Published var step: CalibrationWizardStep = .microphone
@@ -94,16 +102,15 @@ final class CalibrationWizardViewModel: ObservableObject {
         guard !prepared else { return }
         prepared = true
         microphone.refreshDevices()
-        guard prerequisiteIssue == nil else {
-            progressMessage = prerequisiteIssue ?? "校准条件不满足"
-            return
-        }
         guard let device = microphone.preferredDevice() else {
             progressMessage = "没有找到可用的音频输入设备"
             return
         }
         selectedInputUID = device.uid
-        startMicrophone(device)
+        handleInput(device, trigger: .windowPreparation)
+        if let prerequisiteIssue {
+            progressMessage = prerequisiteIssue
+        }
     }
 
     func prepareForPresentation() {
@@ -123,7 +130,20 @@ final class CalibrationWizardViewModel: ObservableObject {
     func selectInput(uid: String) {
         selectedInputUID = uid
         guard let device = microphone.devices.first(where: { $0.uid == uid }) else { return }
-        startMicrophone(device)
+        handleInput(device, trigger: .deviceSelection)
+    }
+
+    func beginMicrophoneDetection() {
+        errorMessage = ""
+        guard prerequisiteIssue == nil else {
+            progressMessage = prerequisiteIssue ?? "校准条件不满足"
+            return
+        }
+        guard let device = microphone.devices.first(where: { $0.uid == selectedInputUID }) else {
+            errorMessage = "请选择可用的输入设备"
+            return
+        }
+        handleInput(device, trigger: .manualDetectionButton)
     }
 
     func goToInstallation() {
@@ -257,8 +277,17 @@ final class CalibrationWizardViewModel: ObservableObject {
         microphone.stop()
     }
 
-    private func startMicrophone(_ device: CalibrationInputDevice) {
+    private func handleInput(
+        _ device: CalibrationInputDevice,
+        trigger: CalibrationMicrophoneStartTrigger
+    ) {
         activeTask?.cancel()
+        microphone.select(device: device)
+        errorMessage = ""
+        guard trigger.startsCapture else {
+            progressMessage = "已选择 \(device.name)；点击“开始检测麦克风”后才会使用麦克风"
+            return
+        }
         activeTask = Task { @MainActor [weak self] in
             guard let self else { return }
             progressMessage = "正在请求麦克风权限并连接 \(device.name)…"
@@ -424,6 +453,17 @@ private struct MicrophoneCalibrationStep: View {
             }
             .disabled(viewModel.isBusy || microphone.devices.isEmpty)
 
+            Button(microphone.snapshot.status == .running ? "重新检测麦克风" : "开始检测麦克风") {
+                viewModel.beginMicrophoneDetection()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(
+                viewModel.isBusy
+                    || microphone.devices.isEmpty
+                    || viewModel.prerequisiteIssue != nil
+                    || microphone.snapshot.status == .requestingPermission
+            )
+
             Grid(alignment: .leading, horizontalSpacing: 30, verticalSpacing: 8) {
                 GridRow { Text("RMS"); Text(format(microphone.snapshot.rmsDBFS) + " dBFS").monospacedDigit() }
                 GridRow { Text("Peak"); Text(format(microphone.snapshot.peakDBFS) + " dBFS").monospacedDigit() }
@@ -447,7 +487,7 @@ private struct MicrophoneCalibrationStep: View {
         case .requestingPermission: return "○ 正在请求麦克风权限"
         case .deviceChanged: return "○ 输入设备已变化"
         case .failed(let message): return "○ \(message)"
-        case .idle: return "○ 麦克风未启动"
+        case .idle: return "○ 尚未检测；麦克风未启动"
         }
     }
 

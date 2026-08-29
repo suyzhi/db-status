@@ -1,8 +1,83 @@
+import CoreAudio
 import Foundation
 import Testing
 @testable import VolumeMonitor
 
 @Suite struct CalibrationTests {
+    @Test func microphoneInputFormatValidatorRejectsInvalidFormats() {
+        #expect(CalibrationInputFormatValidator.isValid(
+            sampleRate: 48_000,
+            channelCount: 1,
+            isStandardPCM: true
+        ))
+        #expect(CalibrationInputFormatValidator.isValid(
+            sampleRate: 44_100,
+            channelCount: 2,
+            isStandardPCM: true
+        ))
+        #expect(!CalibrationInputFormatValidator.isValid(
+            sampleRate: 0,
+            channelCount: 1,
+            isStandardPCM: true
+        ))
+        #expect(!CalibrationInputFormatValidator.isValid(
+            sampleRate: .nan,
+            channelCount: 1,
+            isStandardPCM: true
+        ))
+        #expect(!CalibrationInputFormatValidator.isValid(
+            sampleRate: -48_000,
+            channelCount: 1,
+            isStandardPCM: true
+        ))
+        #expect(!CalibrationInputFormatValidator.isValid(
+            sampleRate: 48_000,
+            channelCount: 0,
+            isStandardPCM: true
+        ))
+        #expect(!CalibrationInputFormatValidator.isValid(
+            sampleRate: 48_000,
+            channelCount: 33,
+            isStandardPCM: true
+        ))
+        #expect(!CalibrationInputFormatValidator.isValid(
+            sampleRate: 48_000,
+            channelCount: 1,
+            isStandardPCM: false
+        ))
+    }
+
+    @Test func microphoneCaptureStartsOnlyFromExplicitButton() {
+        #expect(!CalibrationMicrophoneStartTrigger.windowPreparation.startsCapture)
+        #expect(!CalibrationMicrophoneStartTrigger.deviceSelection.startsCapture)
+        #expect(CalibrationMicrophoneStartTrigger.manualDetectionButton.startsCapture)
+    }
+
+    @Test func virtualAudioTapIsNotTreatedAsExternalMicrophone() {
+        let virtual = CalibrationInputDevice(
+            id: 124,
+            uid: "com.volumemonitor.audio-tap.test",
+            name: "VolumeMonitor Audio Tap",
+            transportType: kAudioDeviceTransportTypeVirtual
+        )
+        #expect(!virtual.isExternal)
+    }
+
+    @MainActor
+    @Test func selectingMicrophoneKeepsCaptureIdle() {
+        let monitor = CalibrationMicrophoneMonitor()
+        let device = CalibrationInputDevice(
+            id: 123,
+            uid: "test-input",
+            name: "Test Input",
+            transportType: kAudioDeviceTransportTypeBuiltIn
+        )
+        monitor.select(device: device)
+        #expect(monitor.snapshot.status == .idle)
+        #expect(monitor.snapshot.device == device)
+        #expect(monitor.inputChainFingerprint == nil)
+    }
+
     @Test func frequencyInterpolationUsesLogFrequency() throws {
         let interpolator = try #require(FrequencyResponseInterpolator(points: [
             FrequencyCalibrationPoint(frequencyHz: 100, relativeDB: -6, stabilityDB: 0.1),
