@@ -38,10 +38,17 @@ final class SettingsWindowController: NSWindowController {
             onMonitoringChanged: onMonitoringChanged
         )
         let hostingController = NSHostingController(rootView: SettingsView(viewModel: viewModel))
+        // VM_OPEN_ADVANCED / VM_OPEN_WIZARD 仅供调试/验证：直接定位到对应页面。
+        if ProcessInfo.processInfo.environment["VM_OPEN_ADVANCED"] == "1" {
+            viewModel.showAdvanced = true
+        }
+        if ProcessInfo.processInfo.environment["VM_OPEN_WIZARD"] == "1" {
+            viewModel.showQuickSetup = true
+        }
         let window = NSWindow(contentViewController: hostingController)
         window.title = "音量监测设置"
-        window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 560, height: 620))
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 560, height: 680))
         window.center()
         super.init(window: window)
     }
@@ -79,9 +86,14 @@ final class SettingsViewModel: ObservableObject {
     @Published var deviceExposure: [DeviceExposureSummary] = []
     @Published var calibrationStatus = "未校准 · 当前使用标准估算模式"
     @Published var hasCurrentCalibration = false
+    @Published var showAdvanced = false
+    @Published var showHistory = false
+    @Published var showQuickSetup = false
+    @Published var currentDosePercent: Double = 0
+    @Published var hasBoundProfile = false
 
-    private let outputMonitor: OutputDeviceMonitor
-    private let profiles: ProfileRepository
+    let outputMonitor: OutputDeviceMonitor
+    let profiles: ProfileRepository
     private let preferences: AppPreferences
     private let calibrationStore: CalibrationStore
     private let onMonitoringChanged: (Bool) -> Void
@@ -114,6 +126,7 @@ final class SettingsViewModel: ObservableObject {
         exposureMode = preferences.exposureMode
         statusBarDisplayMode = preferences.statusBarDisplayMode
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        hasBoundProfile = device.uid.flatMap { profiles.profile(for: $0)?.isConfirmed } == true
         reloadHistory()
 
         guard let profile = profiles.profile(for: device.uid) else {
@@ -347,6 +360,12 @@ final class SettingsViewModel: ObservableObject {
                 ) * 100
             )
         }.sorted { $0.dosePercent > $1.dosePercent }
+
+        let sevenDayEnergy = buckets.reduce(0) { $0 + $1.normalizedEnergyAt80Seconds }
+        currentDosePercent = ExposureMath.doseFraction(
+            normalizedEnergyAt80: sevenDayEnergy,
+            mode: exposureMode
+        ) * 100
     }
 
     private func reloadCalibrationStatus(
@@ -396,6 +415,129 @@ struct SettingsView: View {
     @ObservedObject var viewModel: SettingsViewModel
 
     var body: some View {
+        Group {
+            if viewModel.showAdvanced {
+                advancedForm
+            } else {
+                simpleForm
+            }
+        }
+        .frame(minWidth: 540, minHeight: 600)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $viewModel.showHistory) {
+            HistoryView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.showQuickSetup) {
+            QuickSetupWizardView(
+                viewModel: QuickSetupWizardViewModel(
+                    outputMonitor: viewModel.outputMonitor,
+                    profiles: viewModel.profiles
+                ),
+                onSaved: {
+                    viewModel.reloadCurrentDevice()
+                    viewModel.showQuickSetup = false
+                },
+                onCancel: {
+                    viewModel.showQuickSetup = false
+                }
+            )
+        }
+    }
+
+    // MARK: - 简单页（默认）
+
+    private var simpleForm: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Form {
+                Section("监测") {
+                    Toggle("启用系统音频监测", isOn: Binding(
+                        get: { viewModel.monitoringEnabled },
+                        set: { viewModel.setMonitoringEnabled($0) }
+                    ))
+                    HStack {
+                        Text("菜单栏显示")
+                        Spacer()
+                        Picker("", selection: Binding(
+                            get: {
+                                viewModel.statusBarDisplayMode == .estimatedDBA
+                                    ? StatusBarDisplayMode.estimatedDBA
+                                    : StatusBarDisplayMode.sevenDayDose
+                            },
+                            set: { viewModel.setStatusBarDisplayMode($0) }
+                        )) {
+                            Text("实时 dBA").tag(StatusBarDisplayMode.estimatedDBA)
+                            Text("过去 7 天剂量 %").tag(StatusBarDisplayMode.sevenDayDose)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 230)
+                    }
+                    if viewModel.statusBarDisplayMode == .rmsDBFS {
+                        Text("当前显示为 RMS(A) dBFS（高级选项）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("当前设备") {
+                    LabeledContent("名称", value: viewModel.deviceName)
+                    LabeledContent("档案", value: viewModel.hasBoundProfile ? "✓ 已绑定可信估算" : "未绑定（先做快速设置）")
+                    Button {
+                        viewModel.showQuickSetup = true
+                    } label: {
+                        Label(viewModel.hasBoundProfile ? "重新快速设置…" : "快速设置…", systemImage: "sparkles")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                Section("过去 7 天声暴露") {
+                    HStack {
+                        Text(String(format: "%.1f%%", viewModel.currentDosePercent))
+                            .font(.system(size: 34, weight: .bold))
+                            .monospacedDigit()
+                        Spacer()
+                        Button("查看详情…") { viewModel.showHistory = true }
+                    }
+                    if viewModel.historyPoints.isEmpty {
+                        Text("暂无可信的声暴露记录")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                    } else {
+                        Text("按 WHO 成人参考：80 dBA × 40 小时 = 100%")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+
+            HStack {
+                Spacer()
+                Button("显示高级选项…") {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        viewModel.showAdvanced = true
+                    }
+                }
+                .buttonStyle(.link)
+            }
+            .padding(.horizontal, 22)
+            .padding(.bottom, 10)
+
+            Text(viewModel.message)
+                .font(.caption)
+                .foregroundStyle(viewModel.message.contains("失败") || viewModel.message.contains("请") ? .red : .secondary)
+                .padding(.horizontal, 22)
+            Text("所有档案和暴露记录仅保存在本机。估算结果不代替专业测量或医疗建议。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 22)
+                .padding(.bottom, 12)
+        }
+    }
+
+    // MARK: - 高级页（展开全部现有功能）
+
+    private var advancedForm: some View {
         Form {
             Section("监测") {
                 Toggle("启用系统音频监测", isOn: Binding(
@@ -430,6 +572,9 @@ struct SettingsView: View {
             Section("当前输出设备") {
                 LabeledContent("名称", value: viewModel.deviceName)
                 LabeledContent("CoreAudio UID", value: viewModel.deviceUID.isEmpty ? "不可用" : viewModel.deviceUID)
+                Button { viewModel.showQuickSetup = true } label: {
+                    Label("快速设置当前设备…", systemImage: "sparkles")
+                }
             }
 
             Section("可信估算档案") {
@@ -486,35 +631,7 @@ struct SettingsView: View {
             }
 
             Section("过去 7 天趋势") {
-                if viewModel.historyPoints.isEmpty {
-                    Text("暂无可信的声暴露记录")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Chart(viewModel.historyPoints) { point in
-                        LineMark(
-                            x: .value("时间", point.minute),
-                            y: .value("LAeq", point.equivalentLevelDBA)
-                        )
-                        .foregroundStyle(.blue)
-                        PointMark(
-                            x: .value("时间", point.minute),
-                            y: .value("峰值", point.peakDBA)
-                        )
-                        .foregroundStyle(.orange.opacity(0.45))
-                    }
-                    .frame(height: 140)
-
-                    ForEach(viewModel.deviceExposure.prefix(4)) { device in
-                        HStack {
-                            Text(device.deviceUID).lineLimit(1)
-                            Spacer()
-                            Text(String(format: "%.1f%%", device.dosePercent))
-                                .monospacedDigit()
-                        }
-                        .font(.caption)
-                    }
-                    Button("导出 CSV…") { viewModel.exportCSV() }
-                }
+                Button("查看详情…") { viewModel.showHistory = true }
             }
 
             Text(viewModel.message)
@@ -523,10 +640,72 @@ struct SettingsView: View {
             Text("所有档案和暴露记录仅保存在本机。估算结果不代替专业测量或医疗建议。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("返回简版") {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        viewModel.showAdvanced = false
+                    }
+                }
+                .buttonStyle(.link)
+            }
+            .padding(.top, 4)
         }
         .formStyle(.grouped)
         .padding()
-        .frame(minWidth: 540, minHeight: 600)
-        .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// 趋势/历史详情（弹层）。
+struct HistoryView: View {
+    @ObservedObject var viewModel: SettingsViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("过去 7 天趋势").font(.headline)
+                Spacer()
+                Button("关闭") { viewModel.showHistory = false }
+                    .buttonStyle(.link)
+            }
+            if viewModel.historyPoints.isEmpty {
+                Text("暂无可信的声暴露记录")
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 40)
+                Spacer()
+            } else {
+                Chart(viewModel.historyPoints) { point in
+                    LineMark(
+                        x: .value("时间", point.minute),
+                        y: .value("LAeq", point.equivalentLevelDBA)
+                    )
+                    .foregroundStyle(.blue)
+                    PointMark(
+                        x: .value("时间", point.minute),
+                        y: .value("峰值", point.peakDBA)
+                    )
+                    .foregroundStyle(.orange.opacity(0.45))
+                }
+                .frame(height: 200)
+
+                ForEach(viewModel.deviceExposure.prefix(6)) { device in
+                    HStack {
+                        Text(device.deviceUID).lineLimit(1)
+                        Spacer()
+                        Text(String(format: "%.1f%%", device.dosePercent))
+                            .monospacedDigit()
+                    }
+                    .font(.caption)
+                }
+                HStack {
+                    Spacer()
+                    Button("导出 CSV…") { viewModel.exportCSV() }
+                }
+            }
+            Spacer()
+        }
+        .padding(20)
+        .frame(width: 540, height: 460)
     }
 }

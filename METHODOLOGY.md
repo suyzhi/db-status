@@ -333,6 +333,35 @@ Signature unchanged
 - 打开菜单栏弹窗，检查所有文字、刻度、电平条不重叠。
 - 低音量、高音量、危险等级、无音频、缺权限等状态都要完整显示。
 
+## 问题 10：macOS 26 菜单栏图标不显示（Tahoe 宿主按 bundle id 卡死）
+
+症状：App 正常运行、弹窗正常，但菜单栏里完全没有图标（看不到 🎧，也看不到数字）。
+
+排查结论（2026-08-29 实测）：
+
+- macOS 26 Tahoe 起，第三方 `NSStatusItem` 由 ControlCenter 的 StatusKit 架构统一托管，并
+  **按 bundle id 记忆每个 App 的菜单栏状态**（System Settings → 菜单栏 → 每 App 开关，
+  以及 App 自身 defaults 里的 `NSStatusItem Preferred Position Item-0`）。
+- 某些历史状态（26.x 迁移、反复强杀等）会让某个 bundle id 卡在“屏外 22pt”的坏状态：
+  item 窗口永远保持 `(0,0,16,0)`/`(x, 2014, 16..31, 22)`（正常应为 30/33pt 高），
+  宿主侧不产生任何窗口，任何 App 内修复都无效。
+- 判定方法：`button.window?.frame.height` 长期 < 25；或在菜单栏窗口列表里找不到
+  该 bundle id 对应的宿主窗口。
+- 已验证 **无效** 的修复：改图标/字体/tint、换 Info.plist 各键、删除 defaults 里的
+  `NSStatusItem Preferred Position Item-0`、App 内销毁重建 statusItem ×4、
+  系统设置里切换“菜单栏 → VolumeMonitor”开关、清 cfprefsd、`killall ControlCenter`、
+  给 defaults 写回位置键。**唯一有效的是换一个新的 CFBundleIdentifier**（同二进制
+  同 plist 仅改 id，图标立即上栏；社区 Stats 团队 issue #3120 也确认“按 bundle id
+  卡死，换 id 即好”）。
+- 第二个坑：宿主即使放了槽位，内容是按**创建时的快照**渲染的。旧代码
+  “先设 attributedTitle 🎧 再立刻 `title = ""`”会让创建时内容为空，
+  上栏后是空白槽位、后续改 title 也不更新。创建时就必须给非空内容
+  （现在直接设置 `attributedTitle = "🎧 --"`，不再先设后清）。
+- 本项目的处理：`CFBundleIdentifier` 由 `com.volumemonitor.app` 改为
+  `com.volumemonitor.app2`（用户偏好已迁移；新 id 首次运行会重新弹出系统音频/麦克风
+  授权，属一次性成本）。App 侧新增菜单栏宿主健康检查（2 秒后窗口高度 < 25 判定为
+  未上栏），弹窗会提示去“系统设置 → 菜单栏”允许本应用，避免再次静默失败。
+
 ## 推荐排查流程
 
 以后遇到 macOS 音频采集或权限异常，按这个顺序查：

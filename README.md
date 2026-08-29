@@ -29,6 +29,12 @@ swift run VolumeMonitor --self-test-logic
 
 测试套件使用 Swift Testing，并通过 SwiftPM 锁定依赖版本；只安装 Command Line Tools 也可以运行 `swift test`。
 
+> **macOS 26（Tahoe）注意**：菜单栏项目由系统（ControlCenter/StatusKit）按 bundle id 托管。
+> 若菜单栏图标不显示，先在“系统设置 → 菜单栏”里允许 VolumeMonitor；若仍不显示，
+> 说明该 bundle id 的宿主状态卡死（详见 [METHODOLOGY.md](METHODOLOGY.md) 问题 10），
+> 需要更换 `Packaging/Info.plist` 中的 `CFBundleIdentifier`。当前版本已使用
+> `com.volumemonitor.app2`。
+
 ## EM258 相对校准
 
 弹窗中的“校准…”会打开独立的五步向导，使用外接 EM258 实测耳机相对频响和系统音量曲线。没有 94 dB 声学校准器时，绝对 SPL 仍明确使用耳机灵敏度与输出模型估算。校准、降级和配置格式详见 [METHODOLOGY.md](METHODOLOGY.md)。
