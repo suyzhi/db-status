@@ -19,17 +19,28 @@ struct VolumeCalibrationCurve: Sendable {
     func relativeDB(at volume: Float) -> Double {
         guard let first = points.first, let last = points.last else { return 0 }
         let x = min(max(volume, 0), 1)
-        if x < first.volume {
-            return boundedExtrapolation(x: x, edge: first, neighbor: points[1])
-        }
-        if x > last.volume {
-            return boundedExtrapolation(x: x, edge: last, neighbor: points[points.count - 2])
-        }
+        if x <= first.volume { return first.relativeDB }
+        if x >= last.volume { return last.relativeDB }
         if x == first.volume { return first.relativeDB }
         for (left, right) in zip(points, points.dropFirst()) where x <= right.volume {
             return interpolate(x: x, left: left, right: right)
         }
         return last.relativeDB
+    }
+
+    func relativeDB(
+        at volume: Float,
+        alignedToOriginalModel originalModelDB: (Float) -> Double
+    ) -> Double {
+        guard let first = points.first, let last = points.last else { return 0 }
+        let x = min(max(volume, 0), 1)
+        if x < first.volume {
+            return alignedModelValue(x: x, edge: first, originalModelDB: originalModelDB)
+        }
+        if x > last.volume {
+            return alignedModelValue(x: x, edge: last, originalModelDB: originalModelDB)
+        }
+        return relativeDB(at: x)
     }
 
     private func interpolate(
@@ -43,16 +54,14 @@ struct VolumeCalibrationCurve: Sendable {
         return left.relativeDB + (right.relativeDB - left.relativeDB) * fraction
     }
 
-    private func boundedExtrapolation(
+    private func alignedModelValue(
         x: Float,
         edge: (volume: Float, relativeDB: Double),
-        neighbor: (volume: Float, relativeDB: Double)
+        originalModelDB: (Float) -> Double
     ) -> Double {
-        let width = Double(edge.volume - neighbor.volume)
-        guard abs(width) > .ulpOfOne else { return edge.relativeDB }
-        let slope = (edge.relativeDB - neighbor.relativeDB) / width
-        let extrapolated = edge.relativeDB + slope * Double(x - edge.volume)
-        let limitedAroundEdge = min(max(extrapolated, edge.relativeDB - 24), edge.relativeDB + 24)
-        return min(max(limitedAroundEdge, -80), 24)
+        let currentModel = originalModelDB(x)
+        let edgeModel = originalModelDB(edge.volume)
+        guard currentModel.isFinite, edgeModel.isFinite else { return edge.relativeDB }
+        return edge.relativeDB + currentModel - edgeModel
     }
 }

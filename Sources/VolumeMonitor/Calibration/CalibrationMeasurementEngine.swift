@@ -53,6 +53,7 @@ struct RelativeValidationResult: Sendable, Equatable {
 enum CalibrationMeasurementError: LocalizedError {
     case outputDeviceChanged
     case inputDeviceChanged
+    case inputChainChanged
     case volumeUnavailable(Float)
     case noMeasurement(Double)
     case clipping(Double)
@@ -63,6 +64,7 @@ enum CalibrationMeasurementError: LocalizedError {
         switch self {
         case .outputDeviceChanged: "输出设备在校准过程中发生变化，测试已停止"
         case .inputDeviceChanged: "校准麦克风已断开或发生变化，测试已停止"
+        case .inputChainChanged: "麦克风输入链在校准过程中发生变化，本次校准已停止，请重新开始。"
         case .volumeUnavailable(let volume): "请把系统音量调到 \(Int(volume * 100))% 后重试"
         case .noMeasurement(let frequency): "\(Int(frequency)) Hz 没有获得足够的麦克风数据"
         case .clipping(let frequency): "\(Int(frequency)) Hz 测量时麦克风输入接近削波"
@@ -109,7 +111,7 @@ final class CalibrationMeasurementEngine {
             if let originalVolume { _ = outputMonitor.setVolumeScalar(originalVolume) }
             isRunning = false
         }
-        try await setOrAwaitVolume(0.5, progress: progress)
+        try await setOrAwaitVolume(0.5, outputDeviceUID: outputDeviceUID, progress: progress)
 
         var measurements: [(measurement: CalibrationFrequencyMeasurement, signalRMSDBFS: Double)] = []
         var currentLevel = testSignalRMSDBFS
@@ -120,6 +122,7 @@ final class CalibrationMeasurementEngine {
             let result = try await measureWithRetries(
                 frequencyHz: frequency,
                 initialRMSDBFS: currentLevel,
+                outputDeviceUID: outputDeviceUID,
                 baseFraction: fraction,
                 progress: progress
             )
@@ -182,10 +185,11 @@ final class CalibrationMeasurementEngine {
                 fraction: Double(index) / 3,
                 retry: 0
             ))
-            try await setOrAwaitVolume(volume, progress: progress)
+            try await setOrAwaitVolume(volume, outputDeviceUID: outputDeviceUID, progress: progress)
             let result = try await measureWithRetries(
                 frequencyHz: 1_000,
                 initialRMSDBFS: currentLevel,
+                outputDeviceUID: outputDeviceUID,
                 baseFraction: Double(index) / 3,
                 progress: progress
             )
@@ -234,11 +238,16 @@ final class CalibrationMeasurementEngine {
             isRunning = false
         }
         try verifyDevices(outputDeviceUID: outputDeviceUID)
-        try await setOrAwaitVolume(validationVolume, progress: progress)
+        try await setOrAwaitVolume(
+            validationVolume,
+            outputDeviceUID: outputDeviceUID,
+            progress: progress
+        )
         progress(CalibrationProgress(message: "正在 60% 音量进行独立验证", fraction: 0.2, retry: 0))
         let result = try await measureWithRetries(
             frequencyHz: 1_000,
             initialRMSDBFS: volumeResult.testSignalRMSDBFS,
+            outputDeviceUID: outputDeviceUID,
             baseFraction: 0.3,
             progress: progress
         )
@@ -253,7 +262,7 @@ final class CalibrationMeasurementEngine {
             - volumeResult.referenceNormalizedLevelDBFS
         let error = abs(predicted - measured)
         progress(CalibrationProgress(
-            message: error <= 1 ? "音量曲线验证通过" : "验证偏差较大，建议重新测试",
+            message: Self.validationMessage(errorDB: error),
             fraction: 1,
             retry: 0
         ))
@@ -268,6 +277,7 @@ final class CalibrationMeasurementEngine {
     private func measureWithRetries(
         frequencyHz: Double,
         initialRMSDBFS: Double,
+        outputDeviceUID: String,
         baseFraction: Double,
         progress: @escaping ProgressHandler
     ) async throws -> (measurement: CalibrationFrequencyMeasurement, usedSignalRMSDBFS: Double) {
@@ -283,22 +293,31 @@ final class CalibrationMeasurementEngine {
             ))
 
             microphone.beginFrequencyMeasurement(frequencyHz)
-            try await Task.sleep(for: .milliseconds(450))
-            let noise = microphone.finishFrequencyMeasurement()?.levelDBFS
-                ?? microphone.snapshot.noiseFloorDBFS
+            try await waitWhileVerifyingDevices(
+                milliseconds: 450,
+                outputDeviceUID: outputDeviceUID
+            )
+            let noise = microphone.snapshot.noiseFloorDBFS
+            _ = microphone.finishFrequencyMeasurement()
 
             let attemptSignalLevel = signalLevel
             let toneTask = Task { @MainActor in
                 try await toneGenerator.playTone(
                     frequencyHz: frequencyHz,
-                    duration: 2.2,
+                    duration: 4.6,
                     rmsDBFS: attemptSignalLevel
                 )
             }
             defer { toneTask.cancel() }
-            try await Task.sleep(for: .milliseconds(800))
+            try await waitWhileVerifyingDevices(
+                milliseconds: 800,
+                outputDeviceUID: outputDeviceUID
+            )
             microphone.beginFrequencyMeasurement(frequencyHz)
-            try await Task.sleep(for: .milliseconds(1_050))
+            try await waitWhileVerifyingDevices(
+                milliseconds: 3_100,
+                outputDeviceUID: outputDeviceUID
+            )
             guard let measurement = microphone.finishFrequencyMeasurement(noiseFloorDBFS: noise) else {
                 lastError = CalibrationMeasurementError.noMeasurement(frequencyHz)
                 continue
@@ -336,14 +355,19 @@ final class CalibrationMeasurementEngine {
         guard microphone.verifySelectedDeviceIsPresent() else {
             throw CalibrationMeasurementError.inputDeviceChanged
         }
+        guard microphone.matchesCurrentInputChain() else {
+            throw CalibrationMeasurementError.inputChainChanged
+        }
     }
 
     private func setOrAwaitVolume(
         _ target: Float,
+        outputDeviceUID: String,
         progress: @escaping ProgressHandler
     ) async throws {
         if outputMonitor.setVolumeScalar(target) {
             for _ in 0..<15 {
+                try verifyDevices(outputDeviceUID: outputDeviceUID)
                 outputMonitor.refresh()
                 try await Task.sleep(for: .milliseconds(100))
                 if let volume = outputMonitor.snapshot().volumeScalar, abs(volume - target) < 0.015 {
@@ -359,6 +383,7 @@ final class CalibrationMeasurementEngine {
         ))
         for _ in 0..<600 {
             try Task.checkCancellation()
+            try verifyDevices(outputDeviceUID: outputDeviceUID)
             outputMonitor.refresh()
             try await Task.sleep(for: .milliseconds(100))
             if let volume = outputMonitor.snapshot().volumeScalar, abs(volume - target) < 0.015 {
@@ -366,5 +391,25 @@ final class CalibrationMeasurementEngine {
             }
         }
         throw CalibrationMeasurementError.volumeUnavailable(target)
+    }
+
+    private func waitWhileVerifyingDevices(
+        milliseconds: Int,
+        outputDeviceUID: String
+    ) async throws {
+        var remaining = milliseconds
+        while remaining > 0 {
+            try Task.checkCancellation()
+            try verifyDevices(outputDeviceUID: outputDeviceUID)
+            let interval = min(100, remaining)
+            try await Task.sleep(for: .milliseconds(interval))
+            remaining -= interval
+        }
+    }
+
+    static func validationMessage(errorDB: Double) -> String {
+        if errorDB <= 1.0 { return "音量曲线验证通过" }
+        if errorDB <= 2.0 { return "校准可用，但验证误差偏大" }
+        return "校准验证失败，建议重新测试音量曲线"
     }
 }

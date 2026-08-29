@@ -60,6 +60,22 @@ final class CalibrationWizardViewModel: ObservableObject {
 
     var outputDevice: OutputDeviceSnapshot { outputMonitor.snapshot() }
     var headphoneProfile: TransducerProfile? { profiles.profile(for: outputDevice.uid) }
+    var currentQuality: CalibrationQuality? {
+        guard let frequencyResult, let volumeResult, let validationResult else { return nil }
+        let stabilities = frequencyResult.points.map(\.stabilityDB)
+            + volumeResult.points.map(\.stabilityDB)
+        return CalibrationQuality(
+            averageStabilityDB: stabilities.isEmpty ? 0 : stabilities.reduce(0, +) / Double(stabilities.count),
+            maximumStabilityDB: stabilities.max() ?? 0,
+            minimumSNRDB: min(frequencyResult.minimumSNRDB, volumeResult.minimumSNRDB),
+            relativeValidationErrorDB: validationResult.absoluteErrorDB
+        )
+    }
+    var canSaveCalibration: Bool {
+        !saved && CalibrationValidationPolicy.canSave(
+            relativeValidationErrorDB: validationResult?.absoluteErrorDB
+        )
+    }
 
     var prerequisiteIssue: String? {
         guard outputDevice.uid != nil else { return "无法读取当前输出设备 UID" }
@@ -144,7 +160,7 @@ final class CalibrationWizardViewModel: ObservableObject {
             } catch is CancellationError {
                 progressMessage = "测试已取消"
             } catch {
-                errorMessage = error.localizedDescription
+                handleMeasurementError(error)
             }
         }
     }
@@ -168,7 +184,7 @@ final class CalibrationWizardViewModel: ObservableObject {
             } catch is CancellationError {
                 progressMessage = "测试已取消"
             } catch {
-                errorMessage = error.localizedDescription
+                handleMeasurementError(error)
             }
         }
     }
@@ -179,15 +195,30 @@ final class CalibrationWizardViewModel: ObservableObject {
         if step == .volume || step == .validation { beginVolumeTest() }
     }
 
+    func retryVolumeCurve() {
+        errorMessage = ""
+        volumeResult = nil
+        validationResult = nil
+        saved = false
+        beginVolumeTest()
+    }
+
     func saveCalibration() {
+        guard canSaveCalibration else {
+            errorMessage = "校准验证误差超过 2 dB，不能保存；请重新测试音量曲线。"
+            return
+        }
+        guard microphone.matchesCurrentInputChain() else {
+            handleMeasurementError(CalibrationMeasurementError.inputChainChanged)
+            return
+        }
         guard let profile = headphoneProfile,
               let outputUID = outputDevice.uid,
               let frequencyResult,
               let volumeResult,
-              let validationResult,
-              let input = microphone.snapshot.device else { return }
-        let stabilities = frequencyResult.points.map(\.stabilityDB)
-            + volumeResult.points.map(\.stabilityDB)
+              let input = microphone.snapshot.device,
+              let inputChainFingerprint = microphone.inputChainFingerprint,
+              let quality = currentQuality else { return }
         let calibration = CalibrationProfile(
             headphoneProfileID: profile.id,
             headphoneName: profile.name,
@@ -195,6 +226,7 @@ final class CalibrationWizardViewModel: ObservableObject {
             outputDeviceName: outputDevice.name ?? outputUID,
             inputDeviceUID: input.uid,
             inputDeviceName: input.name,
+            inputChainFingerprint: inputChainFingerprint,
             referenceVolume: 0.5,
             testSignalRMSDBFS: volumeResult.testSignalRMSDBFS,
             frequencyPoints: frequencyResult.points,
@@ -203,12 +235,7 @@ final class CalibrationWizardViewModel: ObservableObject {
             volumeCalibrationValid: true,
             absoluteCalibrationMode: .estimatedFromHeadphoneModel,
             microphoneResponse: .em258NominalUncorrected,
-            quality: CalibrationQuality(
-                averageStabilityDB: stabilities.isEmpty ? 0 : stabilities.reduce(0, +) / Double(stabilities.count),
-                maximumStabilityDB: stabilities.max() ?? 0,
-                minimumSNRDB: min(frequencyResult.minimumSNRDB, volumeResult.minimumSNRDB),
-                relativeValidationErrorDB: validationResult.absoluteErrorDB
-            )
+            quality: quality
         )
         do {
             try calibrationStore.save(calibration)
@@ -261,6 +288,20 @@ final class CalibrationWizardViewModel: ObservableObject {
     private func updateProgress(_ progress: CalibrationProgress) {
         progressMessage = progress.message
         progressFraction = progress.fraction
+    }
+
+    private func handleMeasurementError(_ error: Error) {
+        errorMessage = error.localizedDescription
+        guard let measurementError = error as? CalibrationMeasurementError else { return }
+        switch measurementError {
+        case .inputChainChanged, .inputDeviceChanged, .outputDeviceChanged:
+            frequencyResult = nil
+            volumeResult = nil
+            validationResult = nil
+            microphone.stop()
+        default:
+            break
+        }
     }
 }
 
@@ -353,6 +394,7 @@ struct CalibrationWizardView: View {
         }
         .padding(24)
         .frame(minWidth: 600, minHeight: 520)
+        .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { viewModel.prepare() }
     }
 }
@@ -479,16 +521,49 @@ private struct ValidationCalibrationStep: View {
                 Label("频率响应已实测（9 点）", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 Label("系统音量曲线已实测（3 点）", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 Label("绝对声压仍使用耳机参数估算", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                Text(String(format: "相对曲线验证误差：%.2f dB", validation.absoluteErrorDB))
-                    .monospacedDigit()
-                Text("使用 EM258 标称频响，未进行麦克风个体频响标定。")
+                Label(validationStatus(validation.absoluteErrorDB), systemImage: validationIcon(validation.absoluteErrorDB))
+                    .foregroundStyle(validationColor(validation.absoluteErrorDB))
+                if let quality = viewModel.currentQuality {
+                    Text("相对校准数据质量：\(quality.grade.displayName)").font(.headline)
+                    Text(String(format: "最低 SNR：%.1f dB", quality.minimumSNRDB)).monospacedDigit()
+                    Text(String(format: "最大波动：%.2f dB", quality.maximumStabilityDB)).monospacedDigit()
+                    Text(String(format: "音量验证误差：%.2f dB", validation.absoluteErrorDB)).monospacedDigit()
+                    Text("该等级只描述本次相对校准的数据质量，不代表绝对 SPL 精度。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text("EM258：无个体频响校准文件")
                     .font(.caption).foregroundStyle(.secondary)
-                Button(viewModel.saved ? "已保存" : "保存校准") {
-                    viewModel.saveCalibration()
-                }.buttonStyle(.borderedProminent).disabled(viewModel.saved)
+                HStack {
+                    Button(viewModel.saved ? "已保存" : "保存校准") {
+                        viewModel.saveCalibration()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!viewModel.canSaveCalibration)
+                    if validation.absoluteErrorDB > 2.0 {
+                        Button("重新测试音量曲线") { viewModel.retryVolumeCurve() }
+                            .disabled(viewModel.isBusy)
+                    }
+                }
             } else {
                 Text("等待音量测试完成。")
             }
         }
+    }
+
+
+    private func validationStatus(_ error: Double) -> String {
+        if error <= 1.0 { return "验证通过" }
+        if error <= 2.0 { return "校准可用，但验证误差偏大" }
+        return "校准验证失败，建议重新测试"
+    }
+
+    private func validationIcon(_ error: Double) -> String {
+        error <= 2.0 ? "checkmark.circle.fill" : "xmark.octagon.fill"
+    }
+
+    private func validationColor(_ error: Double) -> Color {
+        if error <= 1.0 { return .green }
+        if error <= 2.0 { return .orange }
+        return .red
     }
 }

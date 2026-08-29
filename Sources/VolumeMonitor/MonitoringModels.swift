@@ -161,8 +161,17 @@ enum LevelEstimator {
                    sensitivityDBV: sensitivityDBV,
                    source: source
                ) {
-                let currentDelta = curve.relativeDB(at: clampedVolume)
-                let referenceDelta = curve.relativeDB(at: calibrationProfile.referenceVolume)
+                let modelShape: (Float) -> Double = { volume in
+                    Double(attenuationDB(at: volume, points: source.volumeCurve))
+                }
+                let currentDelta = curve.relativeDB(
+                    at: clampedVolume,
+                    alignedToOriginalModel: modelShape
+                )
+                let referenceDelta = curve.relativeDB(
+                    at: calibrationProfile.referenceVolume,
+                    alignedToOriginalModel: modelShape
+                )
                 fullScaleDBA = referenceFullScale + Float(currentDelta - referenceDelta)
                 confidence = .relativeCalibrated
                 volumeCalibrationApplied = true

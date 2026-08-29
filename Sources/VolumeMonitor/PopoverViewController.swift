@@ -59,7 +59,11 @@ final class PopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 430))
+        let background = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 360, height: 430))
+        background.material = .popover
+        background.blendingMode = .withinWindow
+        background.state = .active
+        view = background
     }
 
     override func viewDidLoad() {
@@ -120,9 +124,6 @@ final class PopoverViewController: NSViewController {
     }
 
     private func buildUI() {
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-
         titleLabel = label("🎧 听力暴露监测", size: 16, weight: .semibold)
         stateLabel = label("未启动", size: 11, color: .secondaryLabelColor)
         stateLabel.alignment = .right

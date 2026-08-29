@@ -29,6 +29,131 @@ import Testing
         #expect((samples.max() ?? .infinity) <= 24)
     }
 
+    @Test func lowFrequencyLongWindowsRecoverKnownRMS() throws {
+        let sampleRate = 48_000.0
+        let expectedDBFS = -30.0
+        for frequency in [63.0, 125.0, 1_000.0] {
+            let samples = sine(
+                frequencyHz: frequency,
+                rmsDBFS: expectedDBFS,
+                sampleRate: sampleRate,
+                duration: 3.1
+            )
+            let analysis = try #require(CalibrationFrequencyAnalyzer.analyze(
+                samplesByChannel: [samples],
+                sampleRate: sampleRate,
+                frequencyHz: frequency
+            ))
+            #expect(abs(analysis.levelDBFS - expectedDBFS) <= 0.1)
+            #expect(analysis.sampleCount == 144_000)
+            #expect(analysis.windowLevelsDBFS.count == 3)
+        }
+    }
+
+    @Test func longWindowStabilityRespondsToAmplitudeChange() throws {
+        let sampleRate = 48_000.0
+        let stable = sine(frequencyHz: 125, rmsDBFS: -30, sampleRate: sampleRate, duration: 3)
+        let stableAnalysis = try #require(CalibrationFrequencyAnalyzer.analyze(
+            samplesByChannel: [stable],
+            sampleRate: sampleRate,
+            frequencyHz: 125
+        ))
+        #expect(stableAnalysis.stabilityDB <= 0.01)
+
+        let changed = sine(frequencyHz: 125, rmsDBFS: -30, sampleRate: sampleRate, duration: 2)
+            + sine(frequencyHz: 125, rmsDBFS: -24, sampleRate: sampleRate, duration: 1)
+        let changedAnalysis = try #require(CalibrationFrequencyAnalyzer.analyze(
+            samplesByChannel: [changed],
+            sampleRate: sampleRate,
+            frequencyHz: 125
+        ))
+        #expect(changedAnalysis.stabilityDB >= 3)
+    }
+
+    @Test func volumeCurveUsesAlignedOriginalModelOutsideMeasuredRange() throws {
+        let curve = try #require(VolumeCalibrationCurve(points: [
+            VolumeCalibrationPoint(systemVolume: 0.3, relativeDB: -12, stabilityDB: 0.1),
+            VolumeCalibrationPoint(systemVolume: 0.5, relativeDB: 0, stabilityDB: 0.1),
+            VolumeCalibrationPoint(systemVolume: 0.7, relativeDB: 8, stabilityDB: 0.1)
+        ]))
+        let model: (Float) -> Double = { volume in
+            Double(LevelEstimator.defaultAttenuationDB(volumeScalar: volume))
+        }
+        let value: (Float) -> Double = { volume in
+            curve.relativeDB(at: volume, alignedToOriginalModel: model)
+        }
+
+        #expect(abs(value(0.299) - value(0.3)) < 0.2)
+        #expect(abs(value(0.3) - value(0.301)) < 0.2)
+        #expect(abs(value(0.699) - value(0.7)) < 0.2)
+        #expect(abs(value(0.7) - value(0.701)) < 0.2)
+        #expect(abs(value(0.2) - (-12 + model(0.2) - model(0.3))) < 0.000_001)
+        #expect(abs(value(0.8) - (8 + model(0.8) - model(0.7))) < 0.000_001)
+    }
+
+    @Test func inputChainFingerprintDetectsRelevantChanges() {
+        let baseline = CalibrationInputChainFingerprint(
+            deviceUID: "input-A",
+            sampleRate: 48_000,
+            channelCount: 1,
+            formatDescription: "lpcm:float32:noninterleaved",
+            inputGainScalar: 0.5
+        )
+        #expect(baseline.matchesCurrentInputChain(baseline))
+        #expect(!baseline.matchesCurrentInputChain(CalibrationInputChainFingerprint(
+            deviceUID: "input-B",
+            sampleRate: 48_000,
+            channelCount: 1,
+            formatDescription: baseline.formatDescription,
+            inputGainScalar: 0.5
+        )))
+        #expect(!baseline.matchesCurrentInputChain(CalibrationInputChainFingerprint(
+            deviceUID: baseline.deviceUID,
+            sampleRate: 44_100,
+            channelCount: 1,
+            formatDescription: baseline.formatDescription,
+            inputGainScalar: 0.5
+        )))
+        #expect(!baseline.matchesCurrentInputChain(CalibrationInputChainFingerprint(
+            deviceUID: baseline.deviceUID,
+            sampleRate: 48_000,
+            channelCount: 2,
+            formatDescription: baseline.formatDescription,
+            inputGainScalar: 0.5
+        )))
+        #expect(!baseline.matchesCurrentInputChain(CalibrationInputChainFingerprint(
+            deviceUID: baseline.deviceUID,
+            sampleRate: 48_000,
+            channelCount: 1,
+            formatDescription: "different-format",
+            inputGainScalar: 0.5
+        )))
+        #expect(!baseline.matchesCurrentInputChain(CalibrationInputChainFingerprint(
+            deviceUID: baseline.deviceUID,
+            sampleRate: 48_000,
+            channelCount: 1,
+            formatDescription: baseline.formatDescription,
+            inputGainScalar: 0.55
+        )))
+    }
+
+    @Test func calibrationQualityGradesAndSaveGate() {
+        #expect(quality(snr: 25, stability: 0.3, validation: 1).grade == .excellent)
+        #expect(quality(snr: 20, stability: 0.5, validation: 1.5).grade == .good)
+        #expect(quality(snr: 15, stability: 0.7, validation: 2).grade == .acceptable)
+        #expect(quality(snr: 14.9, stability: 0.8, validation: 2.1).grade == .poor)
+        #expect(CalibrationValidationPolicy.canSave(relativeValidationErrorDB: 2.0))
+        #expect(!CalibrationValidationPolicy.canSave(relativeValidationErrorDB: 2.01))
+        #expect(!CalibrationValidationPolicy.canSave(relativeValidationErrorDB: nil))
+
+        var rejectedProfile = makeValidProfile(
+            headphoneProfileID: UUID(),
+            outputUID: "output-rejected"
+        )
+        rejectedProfile.quality.relativeValidationErrorDB = 2.01
+        #expect(rejectedProfile.volumeValidationIssue == "相对音量曲线验证误差超过 2 dB")
+    }
+
     @MainActor
     @Test func calibrationSaveLoadRoundTripAndMultipleHeadphones() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -157,6 +282,13 @@ import Testing
             outputDeviceName: "Test Output",
             inputDeviceUID: "input-A",
             inputDeviceName: "EM258",
+            inputChainFingerprint: CalibrationInputChainFingerprint(
+                deviceUID: "input-A",
+                sampleRate: 48_000,
+                channelCount: 1,
+                formatDescription: "test-lpcm",
+                inputGainScalar: nil
+            ),
             createdAt: Date(timeIntervalSince1970: 1_700_000_000),
             frequencyPoints: zip(CalibrationProfile.requiredFrequenciesHz, relative).map {
                 FrequencyCalibrationPoint(
@@ -179,6 +311,32 @@ import Testing
                 minimumSNRDB: 22,
                 relativeValidationErrorDB: 0.6
             )
+        )
+    }
+
+    private func sine(
+        frequencyHz: Double,
+        rmsDBFS: Double,
+        sampleRate: Double,
+        duration: Double
+    ) -> [Float] {
+        let count = Int((sampleRate * duration).rounded())
+        let peak = pow(10, rmsDBFS / 20) * sqrt(2)
+        return (0..<count).map { index in
+            Float(peak * sin(2 * Double.pi * frequencyHz * Double(index) / sampleRate))
+        }
+    }
+
+    private func quality(
+        snr: Double,
+        stability: Double,
+        validation: Double
+    ) -> CalibrationQuality {
+        CalibrationQuality(
+            averageStabilityDB: stability / 2,
+            maximumStabilityDB: stability,
+            minimumSNRDB: snr,
+            relativeValidationErrorDB: validation
         )
     }
 }

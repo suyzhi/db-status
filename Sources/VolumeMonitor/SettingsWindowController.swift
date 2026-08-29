@@ -527,5 +527,6 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding()
         .frame(minWidth: 540, minHeight: 600)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }

@@ -5,6 +5,34 @@ enum AbsoluteCalibrationMode: String, Codable, Sendable, Equatable {
     case acousticReference
 }
 
+struct CalibrationInputChainFingerprint: Codable, Sendable, Equatable {
+    let deviceUID: String
+    let sampleRate: Double
+    let channelCount: Int
+    let formatDescription: String
+    let inputGainScalar: Float?
+
+    func matchesCurrentInputChain(
+        _ current: CalibrationInputChainFingerprint,
+        gainTolerance: Float = 0.02
+    ) -> Bool {
+        guard deviceUID == current.deviceUID,
+              abs(sampleRate - current.sampleRate) < 0.5,
+              channelCount == current.channelCount,
+              formatDescription == current.formatDescription else {
+            return false
+        }
+        switch (inputGainScalar, current.inputGainScalar) {
+        case (.none, .none):
+            return true
+        case let (.some(expected), .some(actual)):
+            return abs(expected - actual) <= gainTolerance
+        default:
+            return false
+        }
+    }
+}
+
 struct FrequencyCalibrationPoint: Codable, Sendable, Equatable, Identifiable {
     var id: Double { frequencyHz }
     let frequencyHz: Double
@@ -76,6 +104,43 @@ struct CalibrationQuality: Codable, Sendable, Equatable {
         minimumSNRDB: 0,
         relativeValidationErrorDB: nil
     )
+
+    var grade: CalibrationQualityGrade {
+        guard let validation = relativeValidationErrorDB else { return .poor }
+        if minimumSNRDB >= 25, maximumStabilityDB <= 0.3, validation <= 1.0 {
+            return .excellent
+        }
+        if minimumSNRDB >= 20, maximumStabilityDB <= 0.5, validation <= 1.5 {
+            return .good
+        }
+        if minimumSNRDB >= 15, maximumStabilityDB <= 0.7, validation <= 2.0 {
+            return .acceptable
+        }
+        return .poor
+    }
+}
+
+enum CalibrationQualityGrade: String, Codable, Sendable, Equatable, CaseIterable {
+    case excellent
+    case good
+    case acceptable
+    case poor
+
+    var displayName: String {
+        switch self {
+        case .excellent: "优秀"
+        case .good: "良好"
+        case .acceptable: "可用"
+        case .poor: "较差"
+        }
+    }
+}
+
+enum CalibrationValidationPolicy {
+    static func canSave(relativeValidationErrorDB: Double?) -> Bool {
+        guard let error = relativeValidationErrorDB, error.isFinite else { return false }
+        return error <= 2.0
+    }
 }
 
 struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
@@ -91,6 +156,7 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
     var outputDeviceName: String
     var inputDeviceUID: String?
     var inputDeviceName: String?
+    var inputChainFingerprint: CalibrationInputChainFingerprint?
     var createdAt: Date
     var referenceVolume: Float
     var testSignalRMSDBFS: Double
@@ -111,6 +177,7 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
         outputDeviceName: String,
         inputDeviceUID: String? = nil,
         inputDeviceName: String? = nil,
+        inputChainFingerprint: CalibrationInputChainFingerprint? = nil,
         createdAt: Date = .now,
         referenceVolume: Float = 0.5,
         testSignalRMSDBFS: Double = -35,
@@ -130,6 +197,7 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
         self.outputDeviceName = outputDeviceName
         self.inputDeviceUID = inputDeviceUID
         self.inputDeviceName = inputDeviceName
+        self.inputChainFingerprint = inputChainFingerprint
         self.createdAt = createdAt
         self.referenceVolume = referenceVolume
         self.testSignalRMSDBFS = testSignalRMSDBFS
@@ -211,6 +279,11 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
         guard let reference = sorted.first(where: { abs($0.systemVolume - referenceVolume) < 0.002 }),
               abs(reference.relativeDB) <= 0.2 else {
             return "参考音量没有归一化为 0 dB"
+        }
+        guard CalibrationValidationPolicy.canSave(
+            relativeValidationErrorDB: quality.relativeValidationErrorDB
+        ) else {
+            return "相对音量曲线验证误差超过 2 dB"
         }
         return nil
     }
