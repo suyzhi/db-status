@@ -72,6 +72,7 @@ enum CalibrationMeasurementError: LocalizedError {
     case clipping(Double)
     case insufficientSNR(frequency: Double, snr: Double)
     case unstable(frequency: Double, stability: Double)
+    case volumeCurveInconsistent(volume: Float, dropDB: Double)
 
     var errorDescription: String? {
         switch self {
@@ -85,6 +86,8 @@ enum CalibrationMeasurementError: LocalizedError {
             "\(Int(frequency)) Hz 信噪比不足（\(String(format: "%.1f", snr)) dB）。已自动提高到封顶电平重试；仍不足时请重点检查：① 环境噪声——关闭风扇/空调/其它播放（开放式耳罩双向透声，噪声最容易混入低频测量）；② 探头位置——EM258 尽量贴近耳机单元中心并保持稳定（开放式大耳低频对探头位置敏感）；③ 保持耳机和探头不动后点击「仅重测当前阶段」"
         case .unstable(let frequency, let stability):
             "\(Int(frequency)) Hz 测量不稳定（\(String(format: "%.2f", stability)) dB）"
+        case .volumeCurveInconsistent(let volume, let dropDB):
+            "\(Int(volume * 100))% 音量点的麦克风读数比上一档低了约 \(String(format: "%.1f", dropDB)) dB，物理上不可能（该点可能没有真正以目标音量播放）。请确认：① 被测设备上的系统音量确实依次为 30% → 50% → 70%（不要用遥控器/其它软件误调）；② 耳机与 EM258 位置没有移动；③ 然后重测当前阶段。"
         }
     }
 }
@@ -178,7 +181,8 @@ final class CalibrationMeasurementEngine {
                     signalRMSDBFS: item.signalRMSDBFS
                 ) - referenceNormalized,
                 stabilityDB: item.measurement.stabilityDB,
-                measuredLevelDBFS: item.measurement.levelDBFS
+                measuredLevelDBFS: item.measurement.levelDBFS,
+                signalRMSDBFS: item.signalRMSDBFS
             )
         }
         let summary = skipped.isEmpty
@@ -234,6 +238,23 @@ final class CalibrationMeasurementEngine {
             measurements.append((volume, result.measurement, result.usedSignalRMSDBFS))
         }
 
+        // 原始读数一致性校验：系统音量升高，麦克风收到的电平（无论测试音是否
+        // 被削波回退）不应出现大幅下降。若后一档比前一档低 12 dB 以上，说明
+        // 该点很可能没有真正以目标音量播放（音量被外部改动、输出路由切换等），
+        // 拒绝保存，避免生成"数学上自洽但物理上不可能"的音量曲线。
+        let sortedMeasurements = measurements.sorted { $0.volume < $1.volume }
+        var previousMic: Double?
+        for item in sortedMeasurements {
+            let mic = item.measurement.levelDBFS
+            if let previousMic, mic < previousMic - 12 {
+                throw CalibrationMeasurementError.volumeCurveInconsistent(
+                    volume: item.volume,
+                    dropDB: previousMic - mic
+                )
+            }
+            previousMic = mic
+        }
+
         guard let reference = measurements.first(where: { abs($0.volume - 0.5) < 0.002 }) else {
             throw CalibrationMeasurementError.noMeasurement(1_000)
         }
@@ -249,7 +270,8 @@ final class CalibrationMeasurementEngine {
                     signalRMSDBFS: item.signalRMSDBFS
                 ) - referenceNormalized,
                 stabilityDB: item.measurement.stabilityDB,
-                measuredLevelDBFS: item.measurement.levelDBFS
+                measuredLevelDBFS: item.measurement.levelDBFS,
+                signalRMSDBFS: item.signalRMSDBFS
             )
         }
         progress(CalibrationProgress(message: "3 个系统音量点测量完成", fraction: 1, retry: 0))

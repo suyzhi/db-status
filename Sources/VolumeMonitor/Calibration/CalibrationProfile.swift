@@ -39,17 +39,22 @@ struct FrequencyCalibrationPoint: Codable, Sendable, Equatable, Identifiable {
     let relativeDB: Double
     let stabilityDB: Double
     let measuredLevelDBFS: Double?
+    /// 该频点实际播放的测试音电平（dBFS）。不同频点可能因削波回退/提高电平
+    /// 而不同；保存它才能对 relativeDB 做审计（裸麦克风电平不能直接互比）。
+    let signalRMSDBFS: Double?
 
     init(
         frequencyHz: Double,
         relativeDB: Double,
         stabilityDB: Double,
-        measuredLevelDBFS: Double? = nil
+        measuredLevelDBFS: Double? = nil,
+        signalRMSDBFS: Double? = nil
     ) {
         self.frequencyHz = frequencyHz
         self.relativeDB = relativeDB
         self.stabilityDB = stabilityDB
         self.measuredLevelDBFS = measuredLevelDBFS
+        self.signalRMSDBFS = signalRMSDBFS
     }
 }
 
@@ -59,17 +64,21 @@ struct VolumeCalibrationPoint: Codable, Sendable, Equatable, Identifiable {
     let relativeDB: Double
     let stabilityDB: Double
     let measuredLevelDBFS: Double?
+    /// 该音量点实际播放的测试音电平（dBFS），用于审计与一致性校验。
+    let signalRMSDBFS: Double?
 
     init(
         systemVolume: Float,
         relativeDB: Double,
         stabilityDB: Double,
-        measuredLevelDBFS: Double? = nil
+        measuredLevelDBFS: Double? = nil,
+        signalRMSDBFS: Double? = nil
     ) {
         self.systemVolume = systemVolume
         self.relativeDB = relativeDB
         self.stabilityDB = stabilityDB
         self.measuredLevelDBFS = measuredLevelDBFS
+        self.signalRMSDBFS = signalRMSDBFS
     }
 }
 
@@ -272,6 +281,21 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
               abs(reference.relativeDB) <= 0.2 else {
             return "1 kHz 频率点没有归一化为 0 dB"
         }
+        // 归一化一致性审计：具有原始读数与测试音电平的点，其 relativeDB 必须等于
+        // (本点原始 dB − 参考原始 dB) − (本点信号 dB − 参考信号 dB)。
+        // 不同频点可能因削波回退 / 提电平而使用不同测试音，裸麦克风电平不可直接互比；
+        // 这个校验让"4 kHz 多出 4 dB"这类疑问可以直接在数据里验证。
+        if let referenceMic = reference.measuredLevelDBFS,
+           let referenceSignal = reference.signalRMSDBFS {
+            for point in sorted where point.frequencyHz != reference.frequencyHz {
+                guard let mic = point.measuredLevelDBFS,
+                      let signal = point.signalRMSDBFS else { continue }
+                let expected = (mic - referenceMic) - (signal - referenceSignal)
+                if abs(expected - point.relativeDB) > 0.1 {
+                    return "\(Int(point.frequencyHz)) Hz 频响数据与原始读数/测试音电平不一致"
+                }
+            }
+        }
         return nil
     }
 
@@ -286,6 +310,16 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
         guard sorted.count == Self.requiredVolumes.count else { return "音量点数量不完整" }
         for (actual, expected) in zip(sorted.map(\.systemVolume), Self.requiredVolumes) {
             guard abs(actual - expected) < 0.002 else { return "缺少 \(Int(expected * 100))% 音量点" }
+        }
+        // 原始读数一致性：音量升高时麦克风电平不应大幅下降（测试音可能因削波
+        // 回退几 dB，但 12 dB 以上的下跌说明该点未真正以目标音量播放）。
+        var previousMic: Double?
+        for point in sorted {
+            guard let mic = point.measuredLevelDBFS else { continue }
+            if let previousMic, mic < previousMic - 12 {
+                return "\(Int(point.systemVolume * 100))% 音量点实测麦克风读数反而低于上一档，音量曲线不可信"
+            }
+            previousMic = mic
         }
         guard zip(sorted, sorted.dropFirst()).allSatisfy({ $0.relativeDB <= $1.relativeDB }) else {
             return "实测音量曲线不是单调递增"

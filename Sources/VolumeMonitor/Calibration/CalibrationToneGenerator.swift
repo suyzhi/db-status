@@ -31,7 +31,7 @@ final class CalibrationToneGenerator {
     nonisolated static let maximumCalibrationToneDBA: Double = 90
 
     nonisolated static func safeRMSDBFS(
-        requested: Double = -35,
+        requested: Double = -25,
         estimatedFullScaleDBA: Float?
     ) throws -> Double {
         guard let estimatedFullScaleDBA, estimatedFullScaleDBA.isFinite else {

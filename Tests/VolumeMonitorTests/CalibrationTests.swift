@@ -230,6 +230,29 @@ import Testing
     }
 
     @MainActor
+    @Test func volumeValidationRejectsPhysicallyImpossibleMicDrop() {
+        // 复现真实案例：70% 音量点的麦克风读数(-31.1)反而比 50%(-10.4)低 ~20 dB，
+        // 但 relativeDB 因测试音电平不同仍"单调"。原始读数一致性校验必须拒绝。
+        let base = makeValidProfile(headphoneProfileID: UUID(), outputUID: "output-drop")
+        var invalid = base
+        invalid.volumePoints = [
+            VolumeCalibrationPoint(systemVolume: 0.3, relativeDB: -10.08, stabilityDB: 0.002, measuredLevelDBFS: -20.49, signalRMSDBFS: -35),
+            VolumeCalibrationPoint(systemVolume: 0.5, relativeDB: 0, stabilityDB: 0.002, measuredLevelDBFS: -10.41, signalRMSDBFS: -35),
+            VolumeCalibrationPoint(systemVolume: 0.7, relativeDB: 8.29, stabilityDB: 0.003, measuredLevelDBFS: -31.12, signalRMSDBFS: -64)
+        ]
+        #expect(invalid.volumeValidationIssue != nil)
+
+        // 相同 relativeDB 但原始读数正常 → 应有效。
+        var consistent = base
+        consistent.volumePoints = [
+            VolumeCalibrationPoint(systemVolume: 0.3, relativeDB: -10.08, stabilityDB: 0.002, measuredLevelDBFS: -20.49, signalRMSDBFS: -35),
+            VolumeCalibrationPoint(systemVolume: 0.5, relativeDB: 0, stabilityDB: 0.002, measuredLevelDBFS: -10.41, signalRMSDBFS: -35),
+            VolumeCalibrationPoint(systemVolume: 0.7, relativeDB: 8.29, stabilityDB: 0.003, measuredLevelDBFS: -2.12, signalRMSDBFS: -35)
+        ]
+        #expect(consistent.volumeValidationIssue == nil)
+    }
+
+    @MainActor
     @Test func frequencyValidationAcceptsSkippedTopPointsButRequiresMandatoryBand() {
         let base = makeValidProfile(headphoneProfileID: UUID(), outputUID: "output-skip")
 
@@ -343,19 +366,53 @@ import Testing
     }
 
     @Test func toneSafetyLevelUsesHeadphoneModelAndNeverRaisesRequestedLevel() throws {
+        // 基准测试音 -25 dBFS（更响，默认 SNR 更高）。
         #expect(try CalibrationToneGenerator.safeRMSDBFS(
-            requested: -35,
+            requested: -25,
             estimatedFullScaleDBA: 100
-        ) == -35)
+        ) == -25)
         // 90 dBA 上限：满刻度 131 dBA 时压到 -41 dBFS，使声压恰好 90 dBA。
         #expect(try CalibrationToneGenerator.safeRMSDBFS(
-            requested: -35,
+            requested: -25,
             estimatedFullScaleDBA: 131
         ) == -41)
         #expect(try CalibrationToneGenerator.safeRMSDBFS(
-            requested: -35,
+            requested: -25,
             estimatedFullScaleDBA: nil
         ) == -45)
+    }
+
+    @MainActor
+    @Test func frequencyValidationAuditsRelativeDBAgainstRawReadings() {
+        let base = makeValidProfile(headphoneProfileID: UUID(), outputUID: "output-audit")
+
+        // 4 kHz 原始读数/信号差与保存的 relativeDB 不一致（模拟保存错位）→ 拒绝。
+        var mismatched = base
+        mismatched.frequencyPoints = base.frequencyPoints.map { point in
+            guard abs(point.frequencyHz - 4_000) < 0.5 else { return point }
+            return FrequencyCalibrationPoint(
+                frequencyHz: 4_000,
+                relativeDB: 5.81,
+                stabilityDB: 0.2,
+                measuredLevelDBFS: -8.64,
+                signalRMSDBFS: -25
+            )
+        }
+        #expect(mismatched.frequencyValidationIssue != nil)
+
+        // 同一原始读数，把 relativeDB 改成与读数一致 → 应有效。
+        var consistent = base
+        consistent.frequencyPoints = base.frequencyPoints.map { point in
+            guard abs(point.frequencyHz - 4_000) < 0.5 else { return point }
+            return FrequencyCalibrationPoint(
+                frequencyHz: 4_000,
+                relativeDB: 21.36,
+                stabilityDB: 0.2,
+                measuredLevelDBFS: -8.64,
+                signalRMSDBFS: -25
+            )
+        }
+        #expect(consistent.frequencyValidationIssue == nil)
     }
 
     @Test func changedTestSignalLevelIsRemovedFromRelativeAcousticResult() {
@@ -396,13 +453,14 @@ import Testing
                     frequencyHz: $0.0,
                     relativeDB: $0.1,
                     stabilityDB: 0.2,
-                    measuredLevelDBFS: -30 + $0.1
+                    measuredLevelDBFS: -30 + $0.1,
+                    signalRMSDBFS: -25
                 )
             },
             volumePoints: [
-                VolumeCalibrationPoint(systemVolume: 0.3, relativeDB: -12, stabilityDB: 0.2),
-                VolumeCalibrationPoint(systemVolume: 0.5, relativeDB: 0, stabilityDB: 0.2),
-                VolumeCalibrationPoint(systemVolume: 0.7, relativeDB: 8, stabilityDB: 0.2)
+                VolumeCalibrationPoint(systemVolume: 0.3, relativeDB: -12, stabilityDB: 0.2, measuredLevelDBFS: -22, signalRMSDBFS: -35),
+                VolumeCalibrationPoint(systemVolume: 0.5, relativeDB: 0, stabilityDB: 0.2, measuredLevelDBFS: -10, signalRMSDBFS: -35),
+                VolumeCalibrationPoint(systemVolume: 0.7, relativeDB: 8, stabilityDB: 0.2, measuredLevelDBFS: -3, signalRMSDBFS: -35)
             ],
             frequencyCalibrationValid: true,
             volumeCalibrationValid: true,
