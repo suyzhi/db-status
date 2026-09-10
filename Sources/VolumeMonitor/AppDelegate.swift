@@ -214,14 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.image = nil
         button.imagePosition = .noImage
         button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-        button.attributedTitle = NSAttributedString(
-            string: "🎧 --",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 13),
-                .foregroundColor: NSColor.labelColor
-            ]
-        )
-        button.contentTintColor = .labelColor
+        button.attributedTitle = statusBarAttributedTitle("🎧 --")
         button.action = #selector(togglePopover(_:))
         button.target = self
         button.toolTip = "听力暴露监测"
@@ -241,6 +234,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 菜单栏状态项统一使用白色文字；深色菜单栏/壁纸下更清晰。
+    private func statusBarAttributedTitle(_ text: String) -> NSAttributedString {
+        NSAttributedString(
+            string: text,
+            attributes: [
+                .font: statusItem.button?.font
+                    ?? NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: NSColor.white
+            ]
+        )
+    }
+
     private func updateStatusBarIcon() {
         let text = popoverVC.statusBarLevelText
         let color = popoverVC.statusBarLevelColor
@@ -248,8 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard text != lastStatusBarText || colorKey != lastStatusBarColorKey else { return }
         lastStatusBarText = text
         lastStatusBarColorKey = colorKey
-        statusItem.button?.title = text
-        statusItem.button?.contentTintColor = color
+        statusItem.button?.attributedTitle = statusBarAttributedTitle(text)
         switch preferences.statusBarDisplayMode {
         case .estimatedDBA:
             statusItem.button?.toolTip = text == "--" ? "当前无可信 dBA 估算" : "实时估算 ≈\(text) dBA"
