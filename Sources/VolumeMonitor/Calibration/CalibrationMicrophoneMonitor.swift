@@ -169,14 +169,19 @@ enum CalibrationFrequencyAnalyzer {
 }
 
 private final class MicrophoneCaptureState: @unchecked Sendable {
-    let lock = NSLock()
+    /// 状态与宽带电平：主线程 10 Hz 读取，实时线程写入，持锁时间极短。
+    let stateLock = NSLock()
     var status: CalibrationMicrophoneStatus = .idle
     var recentBroadbandLevels: [Double] = []
     var recentPeaks: [Double] = []
+    var tapWasDetected = false
+
+    /// 频点原始样本：只在实时线程与测量线程之间交换。独立于 stateLock，
+    /// 避免主线程刷新界面时被大量样本写入 / 裁剪阻塞。
+    let sampleLock = NSLock()
     var targetFrequencyHz: Double?
     var targetSamplesByChannel: [[Float]] = []
     var targetSampleRate = 0.0
-    var tapWasDetected = false
 }
 
 @MainActor
@@ -265,38 +270,40 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
         updateTimer?.invalidate()
         updateTimer = nil
         stopEngineOnly()
-        captureState.lock.lock()
+        captureState.stateLock.lock()
         captureState.recentBroadbandLevels.removeAll(keepingCapacity: false)
         captureState.recentPeaks.removeAll(keepingCapacity: false)
+        captureState.tapWasDetected = false
+        captureState.status = .idle
+        captureState.stateLock.unlock()
+        captureState.sampleLock.lock()
         captureState.targetSamplesByChannel.removeAll(keepingCapacity: false)
         captureState.targetSampleRate = 0
         captureState.targetFrequencyHz = nil
-        captureState.tapWasDetected = false
-        captureState.status = .idle
-        captureState.lock.unlock()
+        captureState.sampleLock.unlock()
         inputChainFingerprint = nil
         publishSnapshot()
     }
 
     func beginFrequencyMeasurement(_ frequencyHz: Double) {
-        captureState.lock.lock()
+        captureState.sampleLock.lock()
         captureState.targetFrequencyHz = frequencyHz
         captureState.targetSamplesByChannel.removeAll(keepingCapacity: true)
         captureState.targetSampleRate = 0
-        captureState.lock.unlock()
+        captureState.sampleLock.unlock()
     }
 
     func finishFrequencyMeasurement(
         noiseFloorDBFS: Double? = nil
     ) -> CalibrationFrequencyMeasurement? {
-        captureState.lock.lock()
+        captureState.sampleLock.lock()
         let frequency = captureState.targetFrequencyHz
         let samplesByChannel = captureState.targetSamplesByChannel
         let sampleRate = captureState.targetSampleRate
         captureState.targetFrequencyHz = nil
         captureState.targetSamplesByChannel.removeAll(keepingCapacity: true)
         captureState.targetSampleRate = 0
-        captureState.lock.unlock()
+        captureState.sampleLock.unlock()
 
         guard let frequency,
               let analysis = CalibrationFrequencyAnalyzer.analyze(
@@ -428,10 +435,6 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
 
         var strongestRMS = 0.0
         var strongestPeak = 0.0
-        var frequency: Double?
-        captureState.lock.lock()
-        frequency = captureState.targetFrequencyHz
-        captureState.lock.unlock()
 
         for channel in 0..<channelCount {
             let samples = UnsafeBufferPointer(start: channels[channel], count: frameCount)
@@ -448,48 +451,59 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
 
         let rmsDB = Self.dbFS(strongestRMS)
         let peakDB = Self.dbFS(strongestPeak)
-        captureState.lock.lock()
+
+        // 状态锁只覆盖几十个元素的环形读数，主线程刷新不会被样本写入拖住。
+        captureState.stateLock.lock()
         captureState.recentBroadbandLevels.append(rmsDB)
         captureState.recentPeaks.append(peakDB)
         if captureState.recentBroadbandLevels.count > 30 {
             captureState.recentBroadbandLevels.removeFirst()
         }
         if captureState.recentPeaks.count > 30 { captureState.recentPeaks.removeFirst() }
-        if frequency != nil {
+        if let minimum = captureState.recentBroadbandLevels.min(),
+           let maximum = captureState.recentBroadbandLevels.max(),
+           maximum - minimum >= 6 {
+            captureState.tapWasDetected = true
+        }
+        captureState.stateLock.unlock()
+
+        captureState.sampleLock.lock()
+        if captureState.targetFrequencyHz != nil {
             if captureState.targetSamplesByChannel.isEmpty {
                 captureState.targetSamplesByChannel = Array(repeating: [], count: channelCount)
                 captureState.targetSampleRate = buffer.format.sampleRate
             }
             if captureState.targetSamplesByChannel.count == channelCount,
                abs(captureState.targetSampleRate - buffer.format.sampleRate) < 0.5 {
-                let maximumFrames = Int(buffer.format.sampleRate * 5)
+                let sampleRate = buffer.format.sampleRate
+                let maximumFrames = Int(sampleRate * 5)
+                // 一次丢弃约 0.5 秒，避免每个回调都做一次 O(n) 的整体前移。
+                let trimChunkFrames = max(1, Int(sampleRate / 2))
                 for channel in 0..<channelCount {
+                    // 直接原地写回，避免中间变量造成一次 5 秒样本的写时复制。
                     captureState.targetSamplesByChannel[channel].append(
                         contentsOf: UnsafeBufferPointer(start: channels[channel], count: frameCount)
                     )
-                    if captureState.targetSamplesByChannel[channel].count > maximumFrames {
+                    let bufferedFrames = captureState.targetSamplesByChannel[channel].count
+                    if bufferedFrames > maximumFrames {
+                        let excess = bufferedFrames - maximumFrames + trimChunkFrames
                         captureState.targetSamplesByChannel[channel].removeFirst(
-                            captureState.targetSamplesByChannel[channel].count - maximumFrames
+                            min(bufferedFrames, excess)
                         )
                     }
                 }
             }
         }
-        if let minimum = captureState.recentBroadbandLevels.min(),
-           let maximum = captureState.recentBroadbandLevels.max(),
-           maximum - minimum >= 6 {
-            captureState.tapWasDetected = true
-        }
-        captureState.lock.unlock()
+        captureState.sampleLock.unlock()
     }
 
     private func publishSnapshot() {
-        captureState.lock.lock()
+        captureState.stateLock.lock()
         let levels = captureState.recentBroadbandLevels
         let peaks = captureState.recentPeaks
         let currentStatus = captureState.status
         let tapDetected = captureState.tapWasDetected
-        captureState.lock.unlock()
+        captureState.stateLock.unlock()
 
         let rms = levels.last ?? -96
         let peak = peaks.last ?? -96
@@ -511,9 +525,9 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
     }
 
     private func setStatus(_ newStatus: CalibrationMicrophoneStatus) {
-        captureState.lock.lock()
+        captureState.stateLock.lock()
         captureState.status = newStatus
-        captureState.lock.unlock()
+        captureState.stateLock.unlock()
     }
 
     private func stopEngineOnly() {

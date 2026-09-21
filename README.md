@@ -25,6 +25,8 @@ swift run VolumeMonitor --self-test-logic
 ./run.sh
 ```
 
+诊断日志（菜单栏宿主探测）默认关闭；需要排查时以 `VM_DIAG=1` 运行可执行文件，日志写入 `/tmp/vm_diag.log`。
+
 `--self-test-audio` 会在最多约 6 秒内检查 CoreAudio 采集；退出码 `4` 表示采集已启动，但当时没有可用播放音频。
 
 测试套件使用 Swift Testing，并通过 SwiftPM 锁定依赖版本；只安装 Command Line Tools 也可以运行 `swift test`。

@@ -510,6 +510,25 @@ estimatedSPL = fullScaleSPL(v) + calibratedAWeightedRMSDBFS
 
 在“设置与档案”中的“EM258 相对校准”区域点击“删除当前校准并恢复标准估算”，即可回到未校准模式；这个操作不删除耳机参数档案和声暴露历史。
 
+### 监测数据文件
+
+实时电平与声暴露数据和校准配置分开存放：
+
+```text
+~/Library/Application Support/VolumeMonitor/profiles-v2.json
+~/Library/Application Support/VolumeMonitor/exposure-buckets-v2.ndjson
+```
+
+档案内容小、变更少，整体原子重写；分钟桶按行追加，每个分钟桶只在文件末尾增加一行，不再每次整体重写。同一分钟的重复记录在载入时按“能量与时长相加、峰值取大”合并，因此 App 中途重启或某次写入被打断都不会丢数据；裁剪 8 周以前的数据时会整体压缩重写一次。
+
+首次以新版启动时会自动读取旧文件并把其中内容写成上述 v2 文件：
+
+```text
+~/Library/Application Support/VolumeMonitor/monitoring-data-v1.json
+```
+
+v1 原文件不会被修改或删除，可直接回退到旧版本；迁移完成后新版只读写 v2 文件。
+
 ### 将来加入 94 dB 声学校准器
 
 数据模型已预留 `absoluteCalibrationMode.acousticReference`，但当前版本拒绝保存该模式，避免伪造绝对精度。将来需要新增一个独立的 94 dB 参考步骤：固定输入设备、输入增益和完整转接链路，测得 `94 dB SPL → microphone dBFS` 的绝对 offset，并把参考设备、日期和输入链路写入配置。随后才能让运行时用声学参考替换耳机参数绝对基准；频响、音量曲线和 FFT 管线本身无需重写。

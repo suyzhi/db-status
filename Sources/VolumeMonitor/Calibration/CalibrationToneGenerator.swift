@@ -61,22 +61,22 @@ final class CalibrationToneGenerator {
             throw CalibrationToneError.bufferCreationFailed
         }
         buffer.frameLength = frameCount
-        let peakAmplitude = pow(10, rmsDBFS / 20) * sqrt(2)
-        let fadeInFrames = max(1, Int(fadeIn * format.sampleRate))
-        let fadeOutFrames = max(1, Int(fadeOut * format.sampleRate))
         let totalFrames = Int(frameCount)
-        for frame in 0..<totalFrames {
-            let inGain = min(1, Double(frame) / Double(fadeInFrames))
-            let framesRemaining = totalFrames - 1 - frame
-            let outGain = min(1, Double(framesRemaining) / Double(fadeOutFrames))
-            let envelope = min(inGain, outGain)
-            let sample = Float(
-                peakAmplitude * envelope *
-                sin(2 * Double.pi * frequencyHz * Double(frame) / format.sampleRate)
+        let outputChannelCount = Int(format.channelCount)
+        let outputSampleRate = format.sampleRate
+        // 最长 4.6 秒的逐样本合成放到后台线程，避免在校准流程里阻塞主线程。
+        let toneSamples = await Task.detached(priority: .userInitiated) {
+            Self.makeToneSamples(
+                frameCount: totalFrames,
+                sampleRate: outputSampleRate,
+                frequencyHz: frequencyHz,
+                rmsDBFS: rmsDBFS,
+                fadeIn: fadeIn,
+                fadeOut: fadeOut
             )
-            for channel in 0..<Int(format.channelCount) {
-                channels[channel][frame] = sample
-            }
+        }.value
+        for channel in 0..<outputChannelCount {
+            channels[channel].update(from: toneSamples, count: totalFrames)
         }
 
         engine.prepare()
@@ -93,6 +93,32 @@ final class CalibrationToneGenerator {
         }
         try await Task.sleep(for: .seconds(duration))
         _ = await schedulingTask.result
+    }
+
+    nonisolated private static func makeToneSamples(
+        frameCount: Int,
+        sampleRate: Double,
+        frequencyHz: Double,
+        rmsDBFS: Double,
+        fadeIn: TimeInterval,
+        fadeOut: TimeInterval
+    ) -> [Float] {
+        guard frameCount > 0, sampleRate > 0 else { return [] }
+        let peakAmplitude = pow(10, rmsDBFS / 20) * sqrt(2)
+        let fadeInFrames = max(1, Int(fadeIn * sampleRate))
+        let fadeOutFrames = max(1, Int(fadeOut * sampleRate))
+        var samples = [Float](repeating: 0, count: frameCount)
+        for frame in 0..<frameCount {
+            let inGain = min(1, Double(frame) / Double(fadeInFrames))
+            let framesRemaining = frameCount - 1 - frame
+            let outGain = min(1, Double(framesRemaining) / Double(fadeOutFrames))
+            let envelope = min(inGain, outGain)
+            samples[frame] = Float(
+                peakAmplitude * envelope *
+                sin(2 * Double.pi * frequencyHz * Double(frame) / sampleRate)
+            )
+        }
+        return samples
     }
 
     func stop() {

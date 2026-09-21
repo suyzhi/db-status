@@ -471,12 +471,18 @@ final class CalibrationMeasurementEngine {
         outputDeviceUID: String
     ) async throws {
         var remaining = milliseconds
+        var sinceLastVerify = Int.max
         while remaining > 0 {
             try Task.checkCancellation()
-            try verifyDevices(outputDeviceUID: outputDeviceUID)
+            // 设备枚举是 CoreAudio 全量查询，500 ms 一次即可，无需每 100 ms 一次。
+            if sinceLastVerify >= 500 {
+                try verifyDevices(outputDeviceUID: outputDeviceUID)
+                sinceLastVerify = 0
+            }
             let interval = min(100, remaining)
             try await Task.sleep(for: .milliseconds(interval))
             remaining -= interval
+            sinceLastVerify += interval
         }
     }
 

@@ -232,7 +232,9 @@ enum LevelEstimator {
     }
 
     private static func attenuationDB(at volume: Float, points: [VolumeCurvePoint]) -> Float {
-        let sorted = points.sorted { $0.volumeScalar < $1.volumeScalar }
+        let sorted = points.isOrdered(by: { $0.volumeScalar < $1.volumeScalar })
+            ? points
+            : points.sorted { $0.volumeScalar < $1.volumeScalar }
         guard sorted.count >= 2 else { return defaultAttenuationDB(volumeScalar: volume) }
         return interpolate(
             x: volume,
@@ -244,7 +246,9 @@ enum LevelEstimator {
         at volume: Float,
         points: [AcousticCalibrationPoint]
     ) -> Float? {
-        let sorted = points.sorted { $0.volumeScalar < $1.volumeScalar }
+        let sorted = points.isOrdered(by: { $0.volumeScalar < $1.volumeScalar })
+            ? points
+            : points.sorted { $0.volumeScalar < $1.volumeScalar }
         guard let first = sorted.first else { return nil }
 
         if sorted.count == 1 {
@@ -332,5 +336,16 @@ enum ExposureMath {
         let energyPerSecond = pow(10, (levelDBA - 80) / 10)
         guard energyPerSecond > 0 else { return nil }
         return remainingEnergy / energyPerSecond
+    }
+}
+
+private extension Array {
+    /// 已排序时省掉一次 sort：估算在 10 Hz 刷新路径上，曲线通常早已有序。
+    func isOrdered(by areInIncreasingOrder: (Element, Element) -> Bool) -> Bool {
+        guard count > 1 else { return true }
+        for index in 1..<count where areInIncreasingOrder(self[index], self[index - 1]) {
+            return false
+        }
+        return true
     }
 }

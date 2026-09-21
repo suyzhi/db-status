@@ -195,7 +195,8 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         let fallbackReason = calibrationFallbackReason
         stateLock.unlock()
 
-        if status == .capturing {
+        // 必须使用锁内拷贝出的 effectiveStatus，直接读属性是无保护的数据竞争。
+        if effectiveStatus == .capturing {
             let now = Self.monotonicTime()
             if let lastSample, now - lastSample > 2 {
                 effectiveStatus = .noAudio
@@ -394,10 +395,17 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
     }
 
     fileprivate func processAudioBufferList(_ audioBufferList: UnsafePointer<AudioBufferList>?) {
-        guard let audioBufferList,
-              let standardLevels = aWeightingMeter.measure(audioBufferList) else { return }
+        guard let audioBufferList else { return }
+        // 校准引擎一旦产出窗口就只走 FFT 路径，避免每个回调都白跑一遍
+        // 会被丢弃的逐样本 A 加权标量循环；仅在引擎尚未就绪时回退。
         let calibratedLevels = calibratedMeter?.measure(audioBufferList)
-        let levels = calibratedLevels ?? standardLevels
+        let levels: (rms: Float, peak: Float)
+        if let calibratedLevels {
+            levels = calibratedLevels
+        } else {
+            guard let standardLevels = aWeightingMeter.measure(audioBufferList) else { return }
+            levels = standardLevels
+        }
         vm_atomic_u32_store(calibrationAppliedBits, calibratedLevels == nil ? 0 : 1)
 
         let oldRMS = Float(bitPattern: vm_atomic_u32_load(rmsLinearBits))
@@ -627,28 +635,37 @@ final class AWeightingMeter {
         var peak: Float = 0
         var sampleCount = 0
         var channelOffset = 0
+        var layoutInvalid = false
 
-        for buffer in buffers {
-            guard let data = buffer.mData else { continue }
-            let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
-            let channelCount = max(1, Int(buffer.mNumberChannels))
-            let frameCount = count / channelCount
-            guard frameCount > 0, channelOffset + channelCount <= filters.count else { return nil }
-            let samples = data.bindMemory(to: Float.self, capacity: count)
-
-            for frame in 0..<frameCount {
-                for channel in 0..<channelCount {
-                    let sample = samples[frame * channelCount + channel]
-                    peak = max(peak, abs(sample))
-                    let weighted = filters[channelOffset + channel].process(Double(sample))
-                    sumSquares += weighted * weighted
+        // 走 UnsafeMutableBufferPointer，避免实时线程上逐样本的数组边界检查。
+        filters.withUnsafeMutableBufferPointer { filterBuffer in
+            for buffer in buffers {
+                guard let data = buffer.mData else { continue }
+                let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+                let channelCount = max(1, Int(buffer.mNumberChannels))
+                let frameCount = count / channelCount
+                guard frameCount > 0,
+                      channelOffset + channelCount <= filterBuffer.count else {
+                    layoutInvalid = true
+                    return
                 }
+                let samples = data.bindMemory(to: Float.self, capacity: count)
+
+                for frame in 0..<frameCount {
+                    let base = frame * channelCount
+                    for channel in 0..<channelCount {
+                        let sample = samples[base + channel]
+                        peak = max(peak, abs(sample))
+                        let weighted = filterBuffer[channelOffset + channel].process(Double(sample))
+                        sumSquares += weighted * weighted
+                    }
+                }
+                sampleCount += frameCount * channelCount
+                channelOffset += channelCount
             }
-            sampleCount += frameCount * channelCount
-            channelOffset += channelCount
         }
 
-        guard sampleCount > 0 else { return nil }
+        guard !layoutInvalid, sampleCount > 0 else { return nil }
         return (
             rms: min(max(Float(sqrt(sumSquares / Double(sampleCount))), 0), 1),
             peak: min(max(peak, 0), 1)

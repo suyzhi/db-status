@@ -154,7 +154,7 @@ else
 fi
 
 echo "🛑 Killing old instance..."
-pkill -9 -f "VolumeMonitor" 2>/dev/null || true
+pkill -9 -x VolumeMonitor 2>/dev/null || true
 sleep 0.3
 
 echo "🚀 Launching..."
