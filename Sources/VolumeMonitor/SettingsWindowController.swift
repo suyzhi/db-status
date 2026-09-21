@@ -37,18 +37,20 @@ final class SettingsWindowController: NSWindowController {
             calibrationStore: calibrationStore,
             onMonitoringChanged: onMonitoringChanged
         )
-        let hostingController = NSHostingController(rootView: SettingsView(viewModel: viewModel))
         // VM_OPEN_ADVANCED / VM_OPEN_WIZARD 仅供调试/验证：直接定位到对应页面。
+        // 必须在创建 NSHostingController 之前设置，否则首帧已经按旧值渲染。
         if ProcessInfo.processInfo.environment["VM_OPEN_ADVANCED"] == "1" {
             viewModel.showAdvanced = true
         }
         if ProcessInfo.processInfo.environment["VM_OPEN_WIZARD"] == "1" {
             viewModel.showQuickSetup = true
         }
+        let hostingController = NSHostingController(rootView: SettingsView(viewModel: viewModel))
         let window = NSWindow(contentViewController: hostingController)
         window.title = "音量监测设置"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 560, height: 680))
+        window.setContentSize(NSSize(width: 600, height: 760))
+        window.contentMinSize = NSSize(width: 560, height: 620)
         window.center()
         super.init(window: window)
     }
@@ -60,6 +62,13 @@ final class SettingsWindowController: NSWindowController {
     override func showWindow(_ sender: Any?) {
         viewModel.reloadCurrentDevice()
         super.showWindow(sender)
+        applyOverlayScrollers()
+        // SwiftUI 的 Form 在首次布局后才挂上内部 NSScrollView，稍后再配置一次。
+        DispatchQueue.main.async { [weak self] in self?.applyOverlayScrollers() }
+    }
+
+    private func applyOverlayScrollers() {
+        OverlayScrollers.apply(to: window)
     }
 }
 
@@ -415,14 +424,18 @@ struct SettingsView: View {
     @ObservedObject var viewModel: SettingsViewModel
 
     var body: some View {
-        Group {
-            if viewModel.showAdvanced {
-                advancedForm
-            } else {
-                simpleForm
+        VStack(spacing: 0) {
+            Group {
+                if viewModel.showAdvanced {
+                    advancedForm
+                } else {
+                    simpleForm
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            footer
         }
-        .frame(minWidth: 540, minHeight: 600)
+        .frame(minWidth: 560, minHeight: 620)
         .background(Color(nsColor: .windowBackgroundColor))
         .sheet(isPresented: $viewModel.showHistory) {
             HistoryView(viewModel: viewModel)
@@ -510,29 +523,8 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
-
-            HStack {
-                Spacer()
-                Button("显示高级选项…") {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        viewModel.showAdvanced = true
-                    }
-                }
-                .buttonStyle(.link)
-            }
-            .padding(.horizontal, 22)
-            .padding(.bottom, 10)
-
-            Text(viewModel.message)
-                .font(.caption)
-                .foregroundStyle(viewModel.message.contains("失败") || viewModel.message.contains("请") ? .red : .secondary)
-                .padding(.horizontal, 22)
-            Text("所有档案和暴露记录仅保存在本机。估算结果不代替专业测量或医疗建议。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 22)
-                .padding(.bottom, 12)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     // MARK: - 高级页（展开全部现有功能）
@@ -595,13 +587,13 @@ struct SettingsView: View {
                         TextField("阻抗 (Ω)", text: $viewModel.impedanceOhms)
                     }
                     TextField("输出源最大 Vrms", text: $viewModel.maxOutputVRMS)
-                    TextField("音量曲线（可选，如 25=-40, 50=-18, 100=0）", text: $viewModel.volumeCurveText)
-                    Text("未提供至少两个曲线点时，结果会标记为“估算曲线”。")
+                    TextField("音量曲线（可选）", text: $viewModel.volumeCurveText)
+                    Text("例如 25=-40, 50=-18, 100=0；少于两个曲线点时结果标记为“估算曲线”。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    TextField("校准点（音量%=dBA，如 25=70, 50=82, 100=96）", text: $viewModel.acousticPointsText)
-                    Text("请使用声学耦合器或可追溯的参考测量；扬声器需在固定聆听位置校准。")
+                    TextField("校准点（音量%=dBA）", text: $viewModel.acousticPointsText)
+                    Text("例如 25=70, 50=82, 100=96；请使用声学耦合器或可追溯的参考测量，扬声器需在固定聆听位置校准。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -630,30 +622,57 @@ struct SettingsView: View {
                 .disabled(!viewModel.hasCurrentCalibration)
             }
 
-            Section("过去 7 天趋势") {
-                Button("查看详情…") { viewModel.showHistory = true }
-            }
-
-            Text(viewModel.message)
-                .font(.caption)
-                .foregroundStyle(viewModel.message.contains("失败") || viewModel.message.contains("请") ? .red : .secondary)
-            Text("所有档案和暴露记录仅保存在本机。估算结果不代替专业测量或医疗建议。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            HStack {
-                Spacer()
-                Button("返回简版") {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        viewModel.showAdvanced = false
-                    }
+            Section("过去 7 天声暴露") {
+                HStack {
+                    Text(String(format: "%.1f%%", viewModel.currentDosePercent))
+                        .font(.system(size: 28, weight: .bold))
+                        .monospacedDigit()
+                    Spacer()
+                    Button("查看详情…") { viewModel.showHistory = true }
                 }
-                .buttonStyle(.link)
+                Text("按 WHO 成人参考：80 dBA × 40 小时 = 100%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .padding(.top, 4)
         }
         .formStyle(.grouped)
-        .padding()
+    }
+
+    // MARK: - 底部状态栏（固定，不随内容滚走）
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            Image(systemName: footerIsProblem ? "exclamationmark.triangle.fill" : "info.circle")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(footerIsProblem ? Color.red : Color.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(viewModel.message.isEmpty ? "所有档案和暴露记录仅保存在本机。" : viewModel.message)
+                    .font(.caption)
+                    .foregroundStyle(footerIsProblem ? Color.red : Color.secondary)
+                    .lineLimit(2)
+                Text("估算结果不代替专业测量或医疗建议。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 16)
+            Button(viewModel.showAdvanced ? "返回简版" : "显示高级选项…") {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    viewModel.showAdvanced.toggle()
+                }
+            }
+            .buttonStyle(.link)
+            .fixedSize()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 11)
+        .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private var footerIsProblem: Bool {
+        viewModel.message.contains("失败")
+            || viewModel.message.contains("请")
+            || viewModel.message.contains("无法")
     }
 }
 

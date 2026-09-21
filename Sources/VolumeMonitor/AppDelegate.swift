@@ -27,6 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var calibrationStore = CalibrationStore.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 任何窗口（含 SwiftUI 的 sheet）成为 key window 时都统一滚动条样式。
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidBecomeKey(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: nil
+        )
         installStatusItem()
         outputMonitor.start()
 
@@ -47,7 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover = NSPopover()
         popover.contentViewController = popoverVC
-        popover.behavior = .transient
+        // VM_OPEN_POPOVER=1 时保持弹出，便于截图验证；正常使用仍是 transient。
+        popover.behavior = ProcessInfo.processInfo.environment["VM_OPEN_POPOVER"] == "1"
+            ? .applicationDefined
+            : .transient
         popover.animates = true
 
         if preferences.monitoringEnabled { audioMonitor.start() }
@@ -71,15 +81,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // macOS 26+ 的宿主异常时，按钮窗口始终是 22pt 高（正常为 30/33pt）且无内容，
         // 说明系统侧没有把该 bundle id 的菜单栏项目放上栏。启动后探测一次，之后定时复检。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            Task { @MainActor [weak self] in self?.checkMenuBarHost() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            Task { @MainActor in self?.checkMenuBarHost() }
         }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.checkMenuBarHost() }
         }
     }
 
+    @objc private func windowDidBecomeKey(_ notification: Notification) {
+        OverlayScrollers.apply(to: notification.object as? NSWindow)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self)
         timer?.invalidate()
         exposureService.flush()
         outputMonitor.stop()
@@ -223,6 +238,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func diag(_ message: String) {
+        // 诊断日志只在 VM_DIAG=1 时写入，避免日常运行持续产生 /tmp 残留。
+        guard ProcessInfo.processInfo.environment["VM_DIAG"] == "1" else { return }
         let line = "\(Date()) [VolumeMonitor] \(message)\n"
         if let data = line.data(using: .utf8),
            let handle = FileHandle(forWritingAtPath: "/tmp/vm_diag.log") {

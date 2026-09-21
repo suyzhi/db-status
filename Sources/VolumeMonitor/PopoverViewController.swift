@@ -1,6 +1,16 @@
 import AppKit
 import Foundation
 
+/// 弹出面板里的浅色卡片背景；用 updateLayer 保证跟随浅色/深色外观。
+private final class PopoverCardView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.cornerRadius = 9
+        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.07).cgColor
+    }
+}
+
 @MainActor
 final class PopoverViewController: NSViewController {
     private let audioMonitor: SystemAudioLevelMonitor
@@ -26,6 +36,8 @@ final class PopoverViewController: NSViewController {
     private var monitorButton: NSButton!
     private var retryButton: NSButton!
     private var menuButton: NSPopUpButton!
+
+    private static let panelSize = NSSize(width: 348, height: 252)
 
     private(set) var statusBarLevelText = "--"
     private(set) var statusBarLevelColor = NSColor.systemGray
@@ -53,7 +65,9 @@ final class PopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        let background = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 340, height: 300))
+        let background = NSVisualEffectView(
+            frame: NSRect(origin: .zero, size: Self.panelSize)
+        )
         background.material = .popover
         background.blendingMode = .withinWindow
         background.state = .active
@@ -64,7 +78,7 @@ final class PopoverViewController: NSViewController {
         super.viewDidLoad()
         // NSPopover 以 preferredContentSize 决定弹窗尺寸；
         // 不设置时可能退化为异常大小并导致定位错误。
-        preferredContentSize = NSSize(width: 340, height: 300)
+        preferredContentSize = Self.panelSize
         buildUI()
     }
 
@@ -114,21 +128,23 @@ final class PopoverViewController: NSViewController {
         if MenuBarHostStatus.unhosted {
             // macOS 26+ 系统侧未把本应用的菜单栏项目放上栏（通常需要在
             // 系统设置 → 菜单栏 中允许 VolumeMonitor）。给出明确引导。
-            stateLabel.stringValue = "菜单栏图标未显示"
-            confidenceLabel.stringValue = "打开 系统设置 → 菜单栏，允许 VolumeMonitor 显示后重启应用"
+            setText(stateLabel, "菜单栏图标未显示")
+            setText(confidenceLabel, "打开 系统设置 → 菜单栏，允许 VolumeMonitor 显示后重启应用")
         }
         updateStatusBarPresentation(audio: audio, estimate: estimate, summary: summary)
         monitorButton.title = preferences.monitoringEnabled ? "暂停" : "继续"
     }
 
+    // MARK: - 布局
+
     private func buildUI() {
-        titleLabel = label("🎧 听力暴露", size: 14, weight: .semibold)
-        stateLabel = label("未启动", size: 10, color: .secondaryLabelColor)
+        titleLabel = label("🎧 听力暴露", size: 13, weight: .semibold)
+        stateLabel = label("未启动", size: 11, color: .secondaryLabelColor)
         stateLabel.alignment = .right
         deviceLabel = label("输出：—", size: 11, color: .secondaryLabelColor)
-        levelLabel = label("—", size: 44, weight: .bold)
-        levelLabel.font = .monospacedDigitSystemFont(ofSize: 44, weight: .bold)
-        unitLabel = label("≈ dBA", size: 12, color: .secondaryLabelColor)
+        levelLabel = label("--", size: 40, weight: .semibold, color: .tertiaryLabelColor)
+        levelLabel.font = .monospacedDigitSystemFont(ofSize: 40, weight: .semibold)
+        unitLabel = label("≈ dBA", size: 13, weight: .medium, color: .secondaryLabelColor)
         confidenceLabel = label("需要先为当前设备创建可信档案", size: 11, color: .systemOrange)
         doseLabel = label("过去 7 天声暴露：0%", size: 15, weight: .semibold)
         disclaimerLabel = label("数值为估算，非专业测量。", size: 10, color: .tertiaryLabelColor)
@@ -140,129 +156,97 @@ final class PopoverViewController: NSViewController {
         menuButton = NSPopUpButton(frame: .zero, pullsDown: false)
         menuButton.addItem(withTitle: "更多")
         menuButton.menu?.addItem(.separator())
-        let calibrationItem = NSMenuItem(title: "校准…", action: #selector(showCalibration), keyEquivalent: "")
+        let calibrationItem = NSMenuItem(
+            title: "校准…",
+            action: #selector(showCalibration),
+            keyEquivalent: ""
+        )
         calibrationItem.target = self
         menuButton.menu?.addItem(calibrationItem)
         let quitItem = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "")
         quitItem.target = self
         menuButton.menu?.addItem(quitItem)
         menuButton.font = .systemFont(ofSize: 11)
+        menuButton.controlSize = .regular
 
         let settingsButton = button("设置", action: #selector(showSettings))
 
-        [titleLabel, stateLabel, deviceLabel, levelLabel, unitLabel,
-         confidenceLabel, doseLabel, disclaimerLabel, monitorButton, retryButton,
-         menuButton, settingsButton].forEach(view.addSubview)
+        let card = PopoverCardView()
+        doseLabel.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(doseLabel)
+        NSLayoutConstraint.activate([
+            doseLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            doseLabel.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -12),
+            doseLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            doseLabel.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10)
+        ])
 
-        titleLabel.frame = NSRect(x: 16, y: 266, width: 180, height: 20)
-        stateLabel.frame = NSRect(x: 182, y: 268, width: 142, height: 16)
-        levelLabel.frame = NSRect(x: 16, y: 190, width: 150, height: 62)
-        unitLabel.frame = NSRect(x: 170, y: 206, width: 70, height: 18)
-        confidenceLabel.frame = NSRect(x: 16, y: 172, width: 308, height: 17)
-        doseLabel.frame = NSRect(x: 16, y: 138, width: 308, height: 22)
-        deviceLabel.frame = NSRect(x: 16, y: 112, width: 308, height: 16)
-        monitorButton.frame = NSRect(x: 16, y: 62, width: 92, height: 32)
-        retryButton.frame = NSRect(x: 16, y: 62, width: 120, height: 32)
-        settingsButton.frame = NSRect(x: 114, y: 62, width: 76, height: 32)
-        menuButton.frame = NSRect(x: 196, y: 62, width: 56, height: 32)
-        disclaimerLabel.frame = NSRect(x: 16, y: 24, width: 308, height: 16)
+        let header = row([titleLabel, flexibleSpacer(), stateLabel], alignment: .firstBaseline)
+        let levelRow = row([levelLabel, unitLabel, flexibleSpacer()], alignment: .firstBaseline, spacing: 6)
+        let buttonRow = row([
+            monitorButton,
+            retryButton,
+            settingsButton,
+            menuButton,
+            flexibleSpacer()
+        ], spacing: 8)
+
+        let separatorView = separator()
+        let stack = NSStackView(views: [
+            header,
+            separatorView,
+            levelRow,
+            confidenceLabel,
+            card,
+            deviceLabel,
+            buttonRow,
+            disclaimerLabel
+        ])
+        stack.orientation = .vertical
+        // 用 .leading 而不是 .width：.width 会让 NSStackView 把标签文字改成右对齐。
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.setCustomSpacing(9, after: header)
+        stack.setCustomSpacing(6, after: levelRow)
+        stack.setCustomSpacing(12, after: deviceLabel)
+        stack.setCustomSpacing(8, after: confidenceLabel)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        // 需要通栏的行显式拉满宽度。
+        for fullWidthView in [header, separatorView, card, buttonRow] {
+            fullWidthView.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -14)
+        ])
     }
 
-    private func updateDevice(_ device: OutputDeviceSnapshot) {
-        if let name = device.name, !name.isEmpty {
-            deviceLabel.stringValue = "输出：\(name)"
-        } else {
-            deviceLabel.stringValue = "输出：不可用"
-        }
+    private func row(
+        _ views: [NSView],
+        alignment: NSLayoutConstraint.Attribute = .centerY,
+        spacing: CGFloat = 8
+    ) -> NSStackView {
+        let stack = NSStackView(views: views)
+        stack.orientation = .horizontal
+        stack.alignment = alignment
+        stack.spacing = spacing
+        return stack
     }
 
-    private func updateAudio(
-        _ audio: AudioLevelSnapshot,
-        device: OutputDeviceSnapshot,
-        profile: TransducerProfile?,
-        estimate: LevelEstimate?
-    ) {
-        let needsRetry: Bool
-        switch audio.status {
-        case .noPermission, .failed: needsRetry = true
-        default: needsRetry = false
-        }
-        retryButton.isHidden = !needsRetry
-        monitorButton.isHidden = needsRetry
-
-        if let estimate {
-            levelLabel.stringValue = String(format: "%.1f", estimate.estimatedLevelDBA)
-            confidenceLabel.stringValue = "\(estimate.profileName) · \(estimate.confidence.rawValue)"
-            confidenceLabel.textColor = estimate.volumeCalibrationApplied ? .systemBlue : .systemOrange
-            stateLabel.stringValue = "实时估算"
-            return
-        }
-
-        levelLabel.stringValue = "—"
-        guard preferences.monitoringEnabled else {
-            stateLabel.stringValue = "已暂停"
-            confidenceLabel.stringValue = "启用监测后才会读取系统音频"
-            return
-        }
-        if device.isMuted == true {
-            stateLabel.stringValue = "系统静音"
-            confidenceLabel.stringValue = "静音时不累计声暴露"
-            return
-        }
-        if device.volumeScalar == nil {
-            stateLabel.stringValue = "音量不可读"
-            confidenceLabel.stringValue = "为避免沿用旧数值，已暂停 dBA 估算"
-            return
-        }
-        if profile == nil || profile?.isConfirmed != true {
-            stateLabel.stringValue = "未配置档案"
-            confidenceLabel.stringValue = "打开“设置”一键快速设置"
-            return
-        }
-
-        switch audio.status {
-        case .idle:
-            stateLabel.stringValue = "未启动"
-            confidenceLabel.stringValue = "点击“重试”启动系统音频采集"
-        case .starting:
-            stateLabel.stringValue = "正在启动"
-            confidenceLabel.stringValue = "正在连接 CoreAudio 系统音频 tap"
-        case .capturing, .noAudio:
-            stateLabel.stringValue = "无音频"
-            confidenceLabel.stringValue = "播放声音后开始估算"
-        case .noPermission:
-            stateLabel.stringValue = "需要权限"
-            confidenceLabel.stringValue = "授予系统音频录制权限后点击“重试”"
-        case .failed(let message):
-            stateLabel.stringValue = "采集异常"
-            confidenceLabel.stringValue = message
-        }
+    private func separator() -> NSView {
+        let box = NSBox()
+        box.boxType = .separator
+        return box
     }
 
-    private func updateExposure(_ summary: ExposureSummary, currentLevel: Float?) {
-        let percent = summary.doseFraction * 100
-        doseLabel.stringValue = String(format: "过去 7 天声暴露：%.1f%%", percent)
-        let color: NSColor = percent >= 100 ? .systemRed : percent >= 80 ? .systemOrange : .systemBlue
-        doseLabel.textColor = color
-        statusBarLevelColor = color
-    }
-
-    private func updateStatusBarPresentation(
-        audio: AudioLevelSnapshot,
-        estimate: LevelEstimate?,
-        summary: ExposureSummary
-    ) {
-        switch preferences.statusBarDisplayMode {
-        case .estimatedDBA:
-            statusBarLevelText = estimate.map { "\(Int($0.estimatedLevelDBA.rounded()))" } ?? "--"
-        case .sevenDayDose:
-            statusBarLevelText = "\(Int(min(summary.doseFraction * 100, 999).rounded()))%"
-        case .rmsDBFS:
-            statusBarLevelText = audio.hasUsableAudio
-                ? "\(Int(audio.rmsAWeightedDBFS.rounded()))"
-                : "--"
-        }
-        if statusBarLevelText == "--" { statusBarLevelColor = .systemGray }
+    private func flexibleSpacer() -> NSView {
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        return spacer
     }
 
     private func label(
@@ -284,6 +268,118 @@ final class PopoverViewController: NSViewController {
         button.font = .systemFont(ofSize: 12)
         return button
     }
+
+    /// 10 Hz 刷新时只在内容真的变化时写 NSTextField，避免无谓的重绘。
+    private func setText(_ field: NSTextField, _ value: String) {
+        if field.stringValue != value { field.stringValue = value }
+    }
+
+    private func setTextColor(_ field: NSTextField, _ color: NSColor) {
+        if field.textColor != color { field.textColor = color }
+    }
+
+    // MARK: - 内容更新
+
+    private func updateDevice(_ device: OutputDeviceSnapshot) {
+        if let name = device.name, !name.isEmpty {
+            setText(deviceLabel, "输出：\(name)")
+        } else {
+            setText(deviceLabel, "输出：不可用")
+        }
+    }
+
+    private func updateAudio(
+        _ audio: AudioLevelSnapshot,
+        device: OutputDeviceSnapshot,
+        profile: TransducerProfile?,
+        estimate: LevelEstimate?
+    ) {
+        let needsRetry: Bool
+        switch audio.status {
+        case .noPermission, .failed: needsRetry = true
+        default: needsRetry = false
+        }
+        retryButton.isHidden = !needsRetry
+        monitorButton.isHidden = needsRetry
+
+        if let estimate {
+            setTextColor(levelLabel, .labelColor)
+            setText(levelLabel, String(format: "%.1f", estimate.estimatedLevelDBA))
+            setText(confidenceLabel, "\(estimate.profileName) · \(estimate.confidence.rawValue)")
+            setTextColor(confidenceLabel, estimate.volumeCalibrationApplied ? .systemBlue : .systemOrange)
+            setText(stateLabel, "实时估算")
+            return
+        }
+
+        setTextColor(levelLabel, .tertiaryLabelColor)
+        setText(levelLabel, "--")
+        guard preferences.monitoringEnabled else {
+            setText(stateLabel, "已暂停")
+            setText(confidenceLabel, "启用监测后才会读取系统音频")
+            return
+        }
+        if device.isMuted == true {
+            setText(stateLabel, "系统静音")
+            setText(confidenceLabel, "静音时不累计声暴露")
+            return
+        }
+        if device.volumeScalar == nil {
+            setText(stateLabel, "音量不可读")
+            setText(confidenceLabel, "为避免沿用旧数值，已暂停 dBA 估算")
+            return
+        }
+        if profile == nil || profile?.isConfirmed != true {
+            setText(stateLabel, "未配置档案")
+            setText(confidenceLabel, "打开“设置”一键快速设置")
+            return
+        }
+
+        switch audio.status {
+        case .idle:
+            setText(stateLabel, "未启动")
+            setText(confidenceLabel, "点击“重试”启动系统音频采集")
+        case .starting:
+            setText(stateLabel, "正在启动")
+            setText(confidenceLabel, "正在连接 CoreAudio 系统音频 tap")
+        case .capturing, .noAudio:
+            setText(stateLabel, "无音频")
+            setText(confidenceLabel, "播放声音后开始估算")
+        case .noPermission:
+            setText(stateLabel, "需要权限")
+            setText(confidenceLabel, "授予系统音频录制权限后点击“重试”")
+        case .failed(let message):
+            setText(stateLabel, "采集异常")
+            setText(confidenceLabel, message)
+        }
+    }
+
+    private func updateExposure(_ summary: ExposureSummary, currentLevel: Float?) {
+        let percent = summary.doseFraction * 100
+        setText(doseLabel, String(format: "过去 7 天声暴露：%.1f%%", percent))
+        let color: NSColor = percent >= 100 ? .systemRed : percent >= 80 ? .systemOrange : .systemBlue
+        setTextColor(doseLabel, color)
+        statusBarLevelColor = color
+    }
+
+    private func updateStatusBarPresentation(
+        audio: AudioLevelSnapshot,
+        estimate: LevelEstimate?,
+        summary: ExposureSummary
+    ) {
+        switch preferences.statusBarDisplayMode {
+        case .estimatedDBA:
+            statusBarLevelText = estimate.map { "\(Int($0.estimatedLevelDBA.rounded()))" } ?? "--"
+        case .sevenDayDose:
+            statusBarLevelText = "\(Int(min(summary.doseFraction * 100, 999).rounded()))%"
+        case .rmsDBFS:
+            statusBarLevelText = audio.hasUsableAudio
+                ? "\(Int(audio.rmsAWeightedDBFS.rounded()))"
+                : "--"
+        }
+        if statusBarLevelText == "--" { statusBarLevelColor = .systemGray }
+    }
+
+    // MARK: - 动作
 
     @objc private func toggleMonitoring() {
         onMonitoringChanged?(!preferences.monitoringEnabled)
