@@ -151,31 +151,63 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         }
         requestedCalibrationID = newID
         requestedCalibrationProfile = profile
-        let currentSampleRate = sampleRate
-        let channels = audioChannelCount
         stateLock.unlock()
 
         captureQueue.async { [weak self] in
             guard let self else { return }
-            guard let profile,
-                  profile.frequencyCalibrationUsable,
-                  let currentSampleRate,
-                  let meter = CalibratedAudioLevelMeter(
-                    sampleRate: currentSampleRate,
-                    channelCount: channels,
-                    frequencyPoints: profile.frequencyPoints
-                  ) else {
+            // 启动竞态：本方法通常在 CoreAudio tap 配置完成之前就被调用。
+            // 早期实现把 sampleRate 在调用线程读好再带进来，读到的往往是 nil，
+            // 于是这里会把 configureCoreAudioTap 刚建好的引擎清成 nil，而且因为
+            // requestedCalibrationID 已更新，后续同样参数的调用都会提前返回、
+            // 再也不会重试 —— 表现为"校准随机失效"，两套结果相差 5 dB 以上。
+            // 正确做法：sampleRate 在队列内现读；采集未就绪时保留请求，交给
+            // configureCoreAudioTap 用 requestedCalibrationProfile 建引擎。
+            guard let profile else {
                 calibratedMeter = nil
                 stateLock.lock()
-                calibrationFallbackReason = profile == nil ? nil : "FFT 校准引擎无法启用"
+                calibrationFallbackReason = nil
                 stateLock.unlock()
                 vm_atomic_u32_store(calibrationAppliedBits, 0)
+                AppDiagnostics.log("calib: profile cleared, engine disabled")
+                return
+            }
+            guard profile.frequencyCalibrationUsable else {
+                calibratedMeter = nil
+                stateLock.lock()
+                calibrationFallbackReason = "FFT 校准引擎无法启用"
+                stateLock.unlock()
+                vm_atomic_u32_store(calibrationAppliedBits, 0)
+                AppDiagnostics.log("calib: profile not usable, engine disabled")
+                return
+            }
+
+            stateLock.lock()
+            let currentSampleRate = sampleRate
+            let channels = audioChannelCount
+            stateLock.unlock()
+
+            guard let currentSampleRate else {
+                AppDiagnostics.log("calib: deferred until capture configured")
+                return
+            }
+            guard let meter = CalibratedAudioLevelMeter(
+                sampleRate: currentSampleRate,
+                channelCount: channels,
+                frequencyPoints: profile.frequencyPoints
+            ) else {
+                calibratedMeter = nil
+                stateLock.lock()
+                calibrationFallbackReason = "FFT 校准引擎无法启用"
+                stateLock.unlock()
+                vm_atomic_u32_store(calibrationAppliedBits, 0)
+                AppDiagnostics.log("calib: engine init failed rate=\(currentSampleRate) ch=\(channels)")
                 return
             }
             calibratedMeter = meter
             stateLock.lock()
             calibrationFallbackReason = nil
             stateLock.unlock()
+            AppDiagnostics.log("calib: engine ready rate=\(currentSampleRate) ch=\(channels)")
         }
     }
 
@@ -341,6 +373,9 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
                 stateLock.lock()
                 calibrationFallbackReason = "FFT 校准引擎初始化失败"
                 stateLock.unlock()
+                AppDiagnostics.log("calib: engine init failed at capture start")
+            } else {
+                AppDiagnostics.log("calib: engine built at capture start")
             }
         }
 

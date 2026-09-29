@@ -238,17 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func diag(_ message: String) {
-        // 诊断日志只在 VM_DIAG=1 时写入，避免日常运行持续产生 /tmp 残留。
-        guard ProcessInfo.processInfo.environment["VM_DIAG"] == "1" else { return }
-        let line = "\(Date()) [VolumeMonitor] \(message)\n"
-        if let data = line.data(using: .utf8),
-           let handle = FileHandle(forWritingAtPath: "/tmp/vm_diag.log") {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            try? handle.close()
-        } else {
-            try? line.data(using: .utf8)?.write(to: URL(fileURLWithPath: "/tmp/vm_diag.log"))
-        }
+        AppDiagnostics.log(message)
     }
 
     /// 菜单栏状态项统一使用白色文字；深色菜单栏/壁纸下更清晰。

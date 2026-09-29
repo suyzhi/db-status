@@ -492,7 +492,11 @@ estimatedSPL = fullScaleSPL(v) + calibratedAWeightedRMSDBFS
 
 之后在功率域求和，再开平方得到 RMS。左右声道取较响一侧，避免一个耳朵较响时被立体声平均掩盖。FFT 归一化通过实际窗后时域能量和频域能量比完成，不使用硬编码 offset。零耳机频响曲线已用 100 Hz、1 kHz、4 kHz、10 kHz 正弦与原 `AWeightingMeter` 对照，误差门限为 `< 0.5 dB`。
 
-原 `AWeightingMeter` 没有删除。配置缺失、版本不兼容、设备 UID 不匹配、频点缺失、数值非有限或 FFT 尚未产出结果时，整条链路回退到原来的 A-weighting、经验音量曲线和耳机绝对参数模型。
+原 \`AWeightingMeter\` 没有删除。配置缺失、版本不兼容、设备 UID 不匹配、频点缺失、数值非有限或 FFT 尚未产出结果时，整条链路回退到原来的 A-weighting、经验音量曲线和耳机绝对参数模型。
+
+**校准到底有没有生效，可以直接看弹出面板**：蓝色「EM258 校准生效」表示频响与实测音量曲线都在用；橙色「模型估算 · 原因」表示已整条回退，并会写出退回原因。需要更细的内部状态时用 \`VM_DIAG=1\` 启动，每秒会把 \`freqApplied / volApplied / rmsA / 音量 / offset\` 追加到 \`/tmp/vm_diag.log\`。
+
+> 历史问题（已修）：早期 \`setCalibrationProfile\` 在调用线程读取 \`sampleRate\`，而启动时它通常仍为 \`nil\`，队列块因此把 \`configureCoreAudioTap\` 刚建好的校准引擎清成 \`nil\`；又因为 \`requestedCalibrationID\` 已更新，后续同参数调用会提前返回、**永不重试**。结果是同一次启动里"校准是否生效"取决于两个子系统的启动先后——实测同一二进制连续启动 4 次出现 1 次失效，失效时显示值比生效时低 5 dB 以上（25%~31% 音量下音量曲线差约 4~5 dB，另有频响修正 1~4 dB）。现已改为在采集队列内现读采样率，采集未就绪时保留请求、交由 \`configureCoreAudioTap\` 建引擎。
 
 ### 权限和生命周期
 

@@ -133,6 +133,50 @@ final class PopoverViewController: NSViewController {
         }
         updateStatusBarPresentation(audio: audio, estimate: estimate, summary: summary)
         monitorButton.title = preferences.monitoringEnabled ? "暂停" : "继续"
+        logEstimateDiagnostics(
+            audio: audio,
+            device: device,
+            profile: profile,
+            estimate: estimate,
+            summary: summary
+        )
+    }
+
+    private var lastDiagnosticDate = Date.distantPast
+
+    /// 排查「数值不对」类问题时，把内部判断链写进诊断日志（仅 VM_DIAG=1 生效）。
+    private func logEstimateDiagnostics(
+        audio: AudioLevelSnapshot,
+        device: OutputDeviceSnapshot,
+        profile: TransducerProfile?,
+        estimate: LevelEstimate?,
+        summary: ExposureSummary
+    ) {
+        guard AppDiagnostics.isEnabled else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastDiagnosticDate) >= 1 else { return }
+        lastDiagnosticDate = now
+
+        let estimateText = estimate.map {
+            String(
+                format: "dBA=%.1f conf=%@ freqApplied=%@ volApplied=%@ absEstimated=%@",
+                $0.estimatedLevelDBA,
+                $0.confidence.rawValue,
+                $0.frequencyCalibrationApplied ? "yes" : "no",
+                $0.volumeCalibrationApplied ? "yes" : "no",
+                $0.absoluteLevelIsEstimated ? "yes" : "no"
+            )
+        } ?? "dBA=nil"
+        let volumeText = device.volumeScalar.map { String(format: "%.4f", $0) } ?? "-"
+        let muteText = device.isMuted.map { String($0) } ?? "-"
+        let offsetText = profile?.calibration.map { String(format: "%.1f", $0.offsetDB) } ?? "-"
+        AppDiagnostics.log([
+            "est \(estimateText)",
+            "audio rmsA=\(String(format: "%.1f", audio.rmsAWeightedDBFS)) status=\(audio.status)",
+            "device name=\(device.name ?? "-") vol=\(volumeText) muted=\(muteText)",
+            "profile id=\(profile?.id.uuidString ?? "-") offset=\(offsetText)",
+            "dose=\(String(format: "%.2f%%", summary.doseFraction * 100)) monitoring=\(preferences.monitoringEnabled)"
+        ].joined(separator: " | "))
     }
 
     // MARK: - 布局
@@ -269,6 +313,20 @@ final class PopoverViewController: NSViewController {
         return button
     }
 
+    /// 明确显示当前走的是哪条估算路径。此前无论校准是否生效都显示"已校准"
+    /// （只要档案里有校准偏移记录），因此无法分辨 EM258 曲线是否真的在起作用。
+    private static func calibrationPathText(
+        _ estimate: LevelEstimate,
+        audio: AudioLevelSnapshot
+    ) -> String {
+        if estimate.volumeCalibrationApplied { return "EM258 校准生效" }
+        if estimate.frequencyCalibrationApplied { return "仅频响校准生效" }
+        if let reason = audio.calibrationFallbackReason, !reason.isEmpty {
+            return "模型估算 · \(reason)"
+        }
+        return "模型估算 · \(estimate.confidence.rawValue)"
+    }
+
     /// 10 Hz 刷新时只在内容真的变化时写 NSTextField，避免无谓的重绘。
     private func setText(_ field: NSTextField, _ value: String) {
         if field.stringValue != value { field.stringValue = value }
@@ -305,7 +363,7 @@ final class PopoverViewController: NSViewController {
         if let estimate {
             setTextColor(levelLabel, .labelColor)
             setText(levelLabel, String(format: "%.1f", estimate.estimatedLevelDBA))
-            setText(confidenceLabel, "\(estimate.profileName) · \(estimate.confidence.rawValue)")
+            setText(confidenceLabel, "\(estimate.profileName) · \(Self.calibrationPathText(estimate, audio: audio))")
             setTextColor(confidenceLabel, estimate.volumeCalibrationApplied ? .systemBlue : .systemOrange)
             setText(stateLabel, "实时估算")
             return
