@@ -4,6 +4,16 @@ import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 
+struct ExposureHistoryPoint: Identifiable {
+    var id: Date { minute }
+    let minute: Date
+    let equivalentLevelDBA: Double
+    let peakDBA: Double
+    let deviceUID: String
+}
+
+/// 设备、档案、偏好的编辑状态。主窗口的“设备与校准”“通用”两页共用。
+/// 编辑目标默认是当前输出设备，也可以用 beginEditing(deviceUID:) 改为任一已保存的档案。
 @MainActor
 final class SettingsViewModel: ObservableObject {
     @Published var deviceName = "不可用"
@@ -25,22 +35,20 @@ final class SettingsViewModel: ObservableObject {
     @Published var statusBarDisplayMode: StatusBarDisplayMode
     @Published var launchAtLogin: Bool
     @Published var historyPoints: [ExposureHistoryPoint] = []
-    @Published var annotations: [ExposureAnnotation] = []
-    @Published var deviceExposure: [DeviceExposureSummary] = []
     @Published var calibrationStatus = "未校准 · 当前使用标准估算模式"
     @Published var hasCurrentCalibration = false
-    @Published var showAdvanced = false
-    @Published var showHistory = false
     @Published var showQuickSetup = false
-    @Published var currentDosePercent: Double = 0
-    @Published var hasBoundProfile = false
+    @Published var showEditor = false
+    /// 档案或校准有变化时加一，设备列表据此刷新。
+    @Published var revision = 0
+    /// 正在编辑的档案是否已存在（新设备时为 false）。
+    @Published var editingExists = false
 
     let outputMonitor: OutputDeviceMonitor
     let profiles: ProfileRepository
     private let preferences: AppPreferences
     private let calibrationStore: CalibrationStore
     private let onMonitoringChanged: (Bool) -> Void
-    let onShowWeeklySummary: () -> Void
     private var editingProfileID = UUID()
 
     init(
@@ -48,15 +56,13 @@ final class SettingsViewModel: ObservableObject {
         profiles: ProfileRepository,
         preferences: AppPreferences,
         calibrationStore: CalibrationStore,
-        onMonitoringChanged: @escaping (Bool) -> Void,
-        onShowWeeklySummary: @escaping () -> Void = {}
+        onMonitoringChanged: @escaping (Bool) -> Void
     ) {
         self.outputMonitor = outputMonitor
         self.profiles = profiles
         self.preferences = preferences
         self.calibrationStore = calibrationStore
         self.onMonitoringChanged = onMonitoringChanged
-        self.onShowWeeklySummary = onShowWeeklySummary
         monitoringEnabled = preferences.monitoringEnabled
         exposureMode = preferences.exposureMode
         statusBarDisplayMode = preferences.statusBarDisplayMode
@@ -64,22 +70,33 @@ final class SettingsViewModel: ObservableObject {
         reloadCurrentDevice()
     }
 
+    /// 重新读取偏好，并把编辑目标设为当前输出设备。
     func reloadCurrentDevice() {
         let device = outputMonitor.snapshot()
-        deviceName = device.name ?? "不可用"
-        deviceUID = device.uid ?? ""
         monitoringEnabled = preferences.monitoringEnabled
         exposureMode = preferences.exposureMode
         statusBarDisplayMode = preferences.statusBarDisplayMode
         launchAtLogin = SMAppService.mainApp.status == .enabled
-        hasBoundProfile = device.uid.flatMap { profiles.profile(for: $0)?.isConfirmed } == true
-        reloadHistory()
+        loadFields(deviceUID: device.uid ?? "", deviceName: device.name)
+    }
 
-        guard let profile = profiles.profile(for: device.uid) else {
+    /// 编辑某个已保存的档案（可以不是当前输出设备）。
+    func beginEditing(deviceUID uid: String) {
+        let current = outputMonitor.snapshot()
+        loadFields(deviceUID: uid, deviceName: uid == current.uid ? current.name : nil)
+        showEditor = true
+    }
+
+    private func loadFields(deviceUID uid: String, deviceName name: String?) {
+        deviceUID = uid
+        let profile = uid.isEmpty ? nil : profiles.profile(for: uid)
+        deviceName = name ?? profile?.name ?? (uid.isEmpty ? "不可用" : uid)
+        editingExists = profile != nil
+        guard let profile else {
             calibrationStatus = "未校准 · 当前使用标准估算模式"
             hasCurrentCalibration = false
             editingProfileID = UUID()
-            profileName = device.name ?? ""
+            profileName = name ?? ""
             kind = .wiredHeadphones
             sensitivityUnit = "dbPerVolt"
             sensitivityValue = ""
@@ -90,12 +107,11 @@ final class SettingsViewModel: ObservableObject {
             acousticPointsText = ""
             calibrationOffsetDB = ""
             reference = ""
-            message = device.uid == nil ? "当前没有可配置的输出设备" : "当前设备尚未创建档案"
             return
         }
 
         editingProfileID = profile.id
-        reloadCalibrationStatus(profile: profile, outputUID: device.uid)
+        reloadCalibrationStatus(profile: profile, outputUID: uid)
         profileName = profile.name
         kind = profile.kind
         switch profile.sensitivity {
@@ -122,7 +138,6 @@ final class SettingsViewModel: ObservableObject {
             .joined(separator: ", ")
         calibrationOffsetDB = profile.calibration.map { format($0.offsetDB) } ?? ""
         reference = profile.reference
-        message = "已载入当前设备的档案"
     }
 
     func saveProfile() {
@@ -208,7 +223,10 @@ final class SettingsViewModel: ObservableObject {
                 ))
                 reloadHistory()
             }
-            message = "档案已保存并绑定到当前设备 UID"
+            editingExists = true
+            revision += 1
+            showEditor = false
+            message = "档案「\(profile.name)」已保存"
         } catch {
             message = "保存失败：\(error.localizedDescription)"
         }
@@ -217,9 +235,12 @@ final class SettingsViewModel: ObservableObject {
     func removeProfile() {
         guard !deviceUID.isEmpty else { return }
         do {
+            let name = profileName
             try profiles.removeProfile(for: deviceUID)
+            revision += 1
+            showEditor = false
             reloadCurrentDevice()
-            message = "已删除当前设备的档案，dBA 估算已停止"
+            message = "已删除档案「\(name)」，该设备不再估算 dBA"
         } catch {
             message = "删除失败：\(error.localizedDescription)"
         }
@@ -233,7 +254,12 @@ final class SettingsViewModel: ObservableObject {
                 outputDeviceUID: deviceUID
             )
             reloadCalibrationStatus(profile: profile, outputUID: deviceUID)
-            message = "已删除当前耳机和输出设备的 EM258 校准；已恢复标准估算模式"
+            try? LocalDataStore.shared.addAnnotation(ExposureAnnotation(
+                title: "删除 EM258 校准",
+                detail: "\(profile.name)：恢复按耳机规格估算；此后该设备的数值口径随之改变"
+            ))
+            revision += 1
+            message = "已删除「\(profile.name)」的 EM258 校准，恢复按规格估算"
         } catch {
             message = "删除校准失败：\(error.localizedDescription)"
         }
@@ -256,6 +282,7 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func exportCSV() {
+        reloadHistory()
         let panel = NSSavePanel()
         panel.title = "导出本地声暴露记录"
         panel.nameFieldStringValue = "VolumeMonitor-exposure.csv"
@@ -351,6 +378,7 @@ final class SettingsViewModel: ObservableObject {
             ))
         }
         reloadCurrentDevice()
+        revision += 1
         message = (["已导入 \(importedNames.count) 个档案、\(calibrationCount) 个校准"] + problems)
             .joined(separator: "；")
     }
@@ -402,41 +430,24 @@ final class SettingsViewModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    /// CSV 导出用的过去 7 天分钟明细。
     private func reloadHistory(now: Date = .now) {
         let cutoff = now.addingTimeInterval(-7 * 24 * 60 * 60)
-        let buckets = LocalDataStore.shared.exposureBuckets
+        historyPoints = LocalDataStore.shared.exposureBuckets
             .filter { $0.minute >= cutoff && $0.measuredDuration > 0 }
             .sorted { $0.minute < $1.minute }
-        historyPoints = buckets.compactMap { bucket in
-            guard let level = ExposureMath.equivalentLevelDBA(
-                normalizedEnergyAt80: bucket.normalizedEnergyAt80Seconds,
-                duration: bucket.measuredDuration
-            ) else { return nil }
-            return ExposureHistoryPoint(
-                minute: bucket.minute,
-                equivalentLevelDBA: level,
-                peakDBA: bucket.peakDBA,
-                deviceUID: bucket.deviceUID
-            )
-        }
-        annotations = LocalDataStore.shared.annotations
-        let grouped = Dictionary(grouping: buckets, by: \.deviceUID)
-        deviceExposure = grouped.map { uid, values in
-            let energy = values.reduce(0) { $0 + $1.normalizedEnergyAt80Seconds }
-            return DeviceExposureSummary(
-                deviceUID: uid,
-                dosePercent: ExposureMath.doseFraction(
-                    normalizedEnergyAt80: energy,
-                    mode: exposureMode
-                ) * 100
-            )
-        }.sorted { $0.dosePercent > $1.dosePercent }
-
-        let sevenDayEnergy = buckets.reduce(0) { $0 + $1.normalizedEnergyAt80Seconds }
-        currentDosePercent = ExposureMath.doseFraction(
-            normalizedEnergyAt80: sevenDayEnergy,
-            mode: exposureMode
-        ) * 100
+            .compactMap { bucket in
+                guard let level = ExposureMath.equivalentLevelDBA(
+                    normalizedEnergyAt80: bucket.normalizedEnergyAt80Seconds,
+                    duration: bucket.measuredDuration
+                ) else { return nil }
+                return ExposureHistoryPoint(
+                    minute: bucket.minute,
+                    equivalentLevelDBA: level,
+                    peakDBA: bucket.peakDBA,
+                    deviceUID: bucket.deviceUID
+                )
+            }
     }
 
     private func reloadCalibrationStatus(

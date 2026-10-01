@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 
 /// 菜单栏宿主状态（macOS 26 Tahoe 起由系统按 bundle id 管理；宿主拒绝时按钮窗口会保持
 /// 22pt/零尺寸、且不产生任何带内容的图标）。App 侧只做探测与提示，无法直接修复。
@@ -12,10 +13,9 @@ enum MenuBarHostStatus {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
-    private var popoverVC: PopoverViewController!
-    private var settingsWindowController: SettingsWindowController?
+    private var monitor: MonitorController!
+    private var mainWindowController: MainWindowController?
     private var calibrationWindowController: CalibrationWizardWindowController?
-    private var weeklySummaryWindowController: WeeklySummaryWindowController?
     private var archiveTimer: Timer?
     private var timer: Timer?
     private var lastStatusBarText = ""
@@ -40,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         installStatusItem()
         outputMonitor.start()
 
-        popoverVC = PopoverViewController(
+        monitor = MonitorController(
             audioMonitor: audioMonitor,
             appAttribution: appAttribution,
             outputMonitor: outputMonitor,
@@ -49,16 +49,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             preferences: preferences,
             calibrationStore: calibrationStore
         )
-        popoverVC.onShowSettings = { [weak self] in self?.showSettings() }
-        popoverVC.onShowCalibration = { [weak self] in self?.showCalibration() }
-        popoverVC.onShowWeeklySummary = { [weak self] in self?.showWeeklySummary() }
-        popoverVC.onQuit = { NSApplication.shared.terminate(nil) }
-        popoverVC.onMonitoringChanged = { [weak self] enabled in
-            self?.setMonitoringEnabled(enabled, forceRestart: enabled)
-        }
+        let actions = PopoverActions(
+            toggleMonitoring: { [weak self] in
+                guard let self else { return }
+                setMonitoringEnabled(!preferences.monitoringEnabled, forceRestart: !preferences.monitoringEnabled)
+            },
+            retry: { [weak self] in self?.setMonitoringEnabled(true, forceRestart: true) },
+            quickSetup: { [weak self] in self?.showQuickSetup() },
+            showWeekly: { [weak self] in self?.showMainWindow(.weekly) },
+            showCalibration: { [weak self] in self?.showCalibration() },
+            showSettings: { [weak self] in self?.showMainWindow(.general) },
+            showOverview: { [weak self] in self?.showMainWindow(.overview) },
+            showDevices: { [weak self] in self?.showMainWindow(.devices) },
+            quit: { NSApplication.shared.terminate(nil) }
+        )
+        let popoverContent = NSHostingController(rootView: PopoverView(model: monitor.model, actions: actions))
+        popoverContent.sizingOptions = [.preferredContentSize]
 
         popover = NSPopover()
-        popover.contentViewController = popoverVC
+        popover.contentViewController = popoverContent
         // VM_OPEN_POPOVER=1 时保持弹出，便于截图验证；正常使用仍是 transient。
         popover.behavior = ProcessInfo.processInfo.environment["VM_OPEN_POPOVER"] == "1"
             ? .applicationDefined
@@ -85,16 +94,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if ProcessInfo.processInfo.environment["VM_OPEN_POPOVER"] == "1" {
             presentPopoverWhenReady()
         }
-        // VM_OPEN_WEEKLY=1 供调试/验证用：启动即打开每周小结。
-        if ProcessInfo.processInfo.environment["VM_OPEN_WEEKLY"] == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.showWeeklySummary()
+        if ProcessInfo.processInfo.environment["VM_OPEN_MAIN"] == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.prewarmMainWindow()
             }
         }
-        // VM_OPEN_SETTINGS=1 供调试/验证用：启动即打开设置窗口。
-        if ProcessInfo.processInfo.environment["VM_OPEN_SETTINGS"] == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.showSettings()
+        // VM_OPEN_CALIBRATION=1 供调试/验证用：启动即打开校准向导。
+        if ProcessInfo.processInfo.environment["VM_OPEN_CALIBRATION"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.showCalibration()
+            }
+        }
+        // VM_OPEN_MAIN=overview|weekly|devices|general 供调试/验证用：启动即打开主窗口对应页。
+        if let raw = ProcessInfo.processInfo.environment["VM_OPEN_MAIN"], let tab = MainTab(rawValue: raw) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.showMainWindow(tab)
             }
         }
         // macOS 26+ 的宿主异常时，按钮窗口始终是 22pt 高（正常为 30/33pt）且无内容，
@@ -122,6 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverWillShow(_ notification: Notification) {
+        monitor.reloadDailyStats()
         setRefreshInterval(Self.popoverRefreshInterval)
     }
 
@@ -212,31 +227,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refreshData()
     }
 
-    private func showSettings() {
-        if settingsWindowController == nil {
-            settingsWindowController = SettingsWindowController(
+    private func showMainWindow(_ tab: MainTab) {
+        popover.performClose(nil)
+        makeMainWindowControllerIfNeeded()
+        mainWindowController?.show(tab: tab)
+    }
+
+    private func makeMainWindowControllerIfNeeded() {
+        if mainWindowController == nil {
+            let settings = SettingsViewModel(
                 outputMonitor: outputMonitor,
                 profiles: profileRepository,
                 preferences: preferences,
                 calibrationStore: calibrationStore,
                 onMonitoringChanged: { [weak self] enabled in
                     self?.setMonitoringEnabled(enabled)
-                },
-                onShowWeeklySummary: { [weak self] in self?.showWeeklySummary() }
+                }
+            )
+            mainWindowController = MainWindowController(
+                live: monitor.model,
+                settings: settings,
+                profiles: profileRepository,
+                calibrationStore: calibrationStore,
+                outputMonitor: outputMonitor,
+                onShowCalibration: { [weak self] in self?.showCalibration() },
+                onWillShow: { [weak self] in self?.monitor.reloadDailyStats() }
             )
         }
-        settingsWindowController?.showWindow(nil)
-        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
-    private func showWeeklySummary() {
-        if weeklySummaryWindowController == nil {
-            weeklySummaryWindowController = WeeklySummaryWindowController(profiles: profileRepository)
+    /// 主窗口第一次创建要加载 SwiftUI 分栏、Charts 等框架并汇总数据，现做会卡近一秒半。
+    /// 启动几秒后趁空闲提前建好（不显示），之后打开只剩几十毫秒。
+    private func prewarmMainWindow() {
+        guard mainWindowController == nil else { return }
+        let start = CFAbsoluteTimeGetCurrent()
+        makeMainWindowControllerIfNeeded()
+        mainWindowController?.prewarm {
+            AppDiagnostics.log(String(format: "main window prewarmed in %.0f ms", (CFAbsoluteTimeGetCurrent() - start) * 1000))
         }
-        weeklySummaryWindowController?.showWindow(nil)
-        weeklySummaryWindowController?.window?.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    private func showQuickSetup() {
+        showMainWindow(.devices)
+        mainWindowController?.settings.showQuickSetup = true
     }
 
     private func showCalibration() {
@@ -245,7 +278,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 outputMonitor: outputMonitor,
                 profiles: profileRepository,
                 calibrationStore: calibrationStore,
-                onSaved: { [weak self] in self?.refreshData() }
+                onSaved: { [weak self] in
+                    self?.refreshData()
+                    self?.mainWindowController?.settings.revision += 1
+                }
             )
         }
         calibrationWindowController?.showWindow(nil)
@@ -254,7 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func refreshData() {
-        popoverVC.refresh()
+        monitor.refresh()
         updateStatusBarIcon()
     }
 
@@ -307,8 +343,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func updateStatusBarIcon() {
-        let text = popoverVC.statusBarLevelText
-        let color = popoverVC.statusBarLevelColor
+        let text = monitor.statusBarLevelText
+        let color = monitor.statusBarLevelColor
         let colorKey = statusBarColorKey(color)
         guard text != lastStatusBarText || colorKey != lastStatusBarColorKey else { return }
         lastStatusBarText = text

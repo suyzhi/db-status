@@ -392,6 +392,21 @@ struct ExposureSummary: Sendable, Equatable {
     let remainingTimeAtCurrentLevel: Double?
 }
 
+struct DailyExposureStat: Sendable, Equatable, Identifiable {
+    var id: Date { day }
+    let day: Date
+    let energy: Double
+    let seconds: Double
+
+    func dosePercent(mode: ExposureMode) -> Double {
+        ExposureMath.doseFraction(normalizedEnergyAt80: energy, mode: mode) * 100
+    }
+
+    var equivalentLevelDBA: Double? {
+        ExposureMath.equivalentLevelDBA(normalizedEnergyAt80: energy, duration: seconds)
+    }
+}
+
 @MainActor
 final class ExposureService {
     private let store: LocalDataStore
@@ -486,6 +501,36 @@ final class ExposureService {
 
     func currentSummary(levelDBA: Double?) -> ExposureSummary {
         summary(currentLevel: levelDBA, includePending: true)
+    }
+
+    /// 最近 `days` 天（含今天）每天的能量与收听时长，包含尚未写盘的当前分钟。
+    func dailyStats(days: Int, now: Date = .now) -> [DailyExposureStat] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        guard let first = calendar.date(byAdding: .day, value: -(days - 1), to: today) else { return [] }
+        var energy = Array(repeating: 0.0, count: days)
+        var seconds = Array(repeating: 0.0, count: days)
+        var buckets = store.exposureBuckets.filter { $0.minute >= first }
+        if let pendingBucket, pendingBucket.minute >= first { buckets.append(pendingBucket) }
+        var indexCache: [Int: Int] = [:]
+        let timeZone = calendar.timeZone
+        for bucket in buckets {
+            let local = bucket.minute.timeIntervalSince1970 + Double(timeZone.secondsFromGMT(for: bucket.minute))
+            let dayKey = Int((local / 86_400).rounded(.down))
+            let index = indexCache[dayKey] ?? {
+                let value = calendar.dateComponents([.day], from: first, to: calendar.startOfDay(for: bucket.minute)).day ?? -1
+                indexCache[dayKey] = value
+                return value
+            }()
+            guard energy.indices.contains(index) else { continue }
+            energy[index] += bucket.normalizedEnergyAt80Seconds
+            seconds[index] += bucket.measuredDuration
+        }
+        return (0..<days).compactMap { index in
+            calendar.date(byAdding: .day, value: index, to: first).map {
+                DailyExposureStat(day: $0, energy: energy[index], seconds: seconds[index])
+            }
+        }
     }
 
     func resetSession() {

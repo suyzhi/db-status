@@ -27,12 +27,16 @@ final class WeeklySummaryViewModel: ObservableObject {
         reload()
     }
 
+    /// 归档在启动时和每小时做一次；这里只读存档和本周实时数据，打开页面不卡。
     func reload() {
-        store.archiveCompletedWeeks()
-        current = store.currentWeek()
-        archived = store.archivedWeeks.reversed()
-        mode = preferences.exposureMode
-        annotations = LocalDataStore.shared.annotations
+        // 只在真的变化时发布，避免每次打开窗口都让整页重新计算。
+        let newCurrent = store.currentWeek()
+        if newCurrent != current { current = newCurrent }
+        let newArchived = Array(store.archivedWeeks.reversed())
+        if newArchived != archived { archived = newArchived }
+        if preferences.exposureMode != mode { mode = preferences.exposureMode }
+        let newAnnotations = LocalDataStore.shared.annotations
+        if newAnnotations != annotations { annotations = newAnnotations }
     }
 
     var chartWeeks: [WeeklySummary] {
@@ -49,50 +53,29 @@ final class WeeklySummaryViewModel: ObservableObject {
     }
 }
 
-@MainActor
-final class WeeklySummaryWindowController: NSWindowController {
-    private let viewModel: WeeklySummaryViewModel
-
-    init(profiles: ProfileRepository) {
-        viewModel = WeeklySummaryViewModel(profiles: profiles)
-        let window = NSWindow(contentViewController: NSHostingController(
-            rootView: WeeklySummaryView(viewModel: viewModel)
-        ))
-        window.title = "每周小结"
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 580, height: 680))
-        window.contentMinSize = NSSize(width: 520, height: 480)
-        window.center()
-        super.init(window: window)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func showWindow(_ sender: Any?) {
-        viewModel.reload()
-        super.showWindow(sender)
-        OverlayScrollers.apply(to: window)
-    }
-}
-
 struct WeeklySummaryView: View {
     @ObservedObject var viewModel: WeeklySummaryViewModel
+    @StateObject private var grown = ViewState(false)
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("每周小结").font(.title2.bold())
-                    Text("\(viewModel.mode.displayName)：\(Int(viewModel.mode.baselineDBA)) dBA × 40 小时 = 100%。每周汇总永久保留，分钟明细保留 8 周。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            VStack(alignment: .leading, spacing: 14) {
+                PageHeader(
+                    title: "每周小结",
+                    subtitle: "\(viewModel.mode.displayName)：\(Int(viewModel.mode.baselineDBA)) dBA × 40 小时 = 100% · 每周汇总永久保留"
+                )
+                .appearAnimation()
                 trendChart
-                WeekCard(week: viewModel.current, inProgress: true, viewModel: viewModel)
-                ForEach(viewModel.archived) { week in
-                    WeekCard(week: week, inProgress: false, viewModel: viewModel)
+                    .card()
+                    .appearAnimation(delay: 0.04)
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible())], spacing: 14) {
+                    WeekCard(week: viewModel.current, inProgress: true, viewModel: viewModel)
+                        .appearAnimation(delay: 0.05)
+                    ForEach(Array(viewModel.archived.enumerated()), id: \.element.id) { index, week in
+                        WeekCard(week: week, inProgress: false, viewModel: viewModel)
+                            .appearAnimation(delay: 0.05 + 0.03 * Double(min(index + 1, 3)))
+                    }
                 }
                 if viewModel.archived.isEmpty {
                     Text("第一周结束后，这里会出现历史小结。")
@@ -100,9 +83,17 @@ struct WeeklySummaryView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(20)
+            .padding(24)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .onReveal(
+            reset: { withoutAnimation { grown.value = false } },
+            reveal: {
+                guard !reduceMotion else { return withoutAnimation { grown.value = true } }
+                DispatchQueue.main.async {
+                    withAnimation(.easeOut(duration: 0.45)) { grown.value = true }
+                }
+            }
+        )
     }
 
     private var trendChart: some View {
@@ -114,18 +105,25 @@ struct WeeklySummaryView: View {
                     x: .value("周", week.weekStart, unit: .weekOfYear),
                     y: .value("暴露 %", week.dosePercent(mode: viewModel.mode))
                 )
-                .foregroundStyle(week.id == viewModel.current.id ? Color.accentColor.opacity(0.5) : Color.accentColor)
+                .foregroundStyle(week.id == viewModel.current.id ? Theme.accent.opacity(0.45) : Theme.accent)
+                .cornerRadius(4)
             }
             if peak >= 50 {
                 RuleMark(y: .value("上限", 100))
-                    .foregroundStyle(.red.opacity(0.6))
+                    .foregroundStyle(Theme.loud.opacity(0.6))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
             }
         }
+        .chartYScale(domain: 0...max(peak * 1.2, 1))
+
         .chartYAxisLabel("每周暴露 %")
         // Charts 按环境日历分周；不指定会按周日开始，与汇总的周一起始错开。
         .environment(\.calendar, WeeklySummaryBuilder.calendar)
-        .frame(height: 150)
+        .frame(height: 160)
+        // 从下往上揭开：图表只画一次，动画只改遮罩，不让图表在每一帧重新渲染（那样会卡）。
+        .mask(alignment: .bottom) {
+            Rectangle().frame(height: grown.value ? nil : 0)
+        }
     }
 }
 
@@ -137,57 +135,52 @@ private struct WeekCard: View {
     private static let weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
     var body: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(dateRange).font(.headline)
-                    if inProgress {
-                        Text("进行中").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text(String(format: "%.1f%%", week.dosePercent(mode: viewModel.mode)))
-                        .font(.title3.bold())
-                        .monospacedDigit()
-                        .foregroundStyle(doseColor)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(dateRange).font(.headline)
+                if inProgress {
+                    Text("进行中").font(.caption).foregroundStyle(.secondary)
                 }
-                if week.listeningSeconds <= 0 {
-                    Text("这一周没有可信的声暴露记录").font(.callout).foregroundStyle(.secondary)
-                } else {
-                    Text(overview).font(.callout).monospacedDigit()
-                    if let loudest = week.loudestDay {
-                        Text(String(
-                            format: "最响的一天：%@（平均 %.1f dBA，%@）",
-                            Self.weekdays[loudest.index],
-                            loudest.levelDBA ?? 0,
-                            Self.hoursText(loudest.seconds)
-                        ))
-                        .font(.callout)
-                        .monospacedDigit()
-                    }
-                    if !appLine.isEmpty {
-                        Text("来源：\(appLine)").font(.callout)
-                    }
-                    if significantDevices.count > 1 {
-                        Text("设备：\(deviceLine)").font(.caption).foregroundStyle(.secondary)
-                    }
+                Spacer()
+                Text(String(format: "%.1f%%", week.dosePercent(mode: viewModel.mode)))
+                    .font(.title3.bold())
+                    .monospacedDigit()
+                    .foregroundStyle(doseColor)
+            }
+            if week.listeningSeconds <= 0 {
+                Text("这一周没有可信的声暴露记录").font(.callout).foregroundStyle(.secondary)
+            } else {
+                Text(overview).font(.callout).monospacedDigit()
+                if let loudest = week.loudestDay {
+                    Text(String(
+                        format: "最响的一天：%@（平均 %.1f dBA，%@）",
+                        Self.weekdays[loudest.index],
+                        loudest.levelDBA ?? 0,
+                        Self.hoursText(loudest.seconds)
+                    ))
+                    .font(.callout)
+                    .monospacedDigit()
                 }
-                ForEach(viewModel.annotations(in: week)) { annotation in
-                    Text("◆ \(annotation.date.formatted(.dateTime.month().day())) \(annotation.title)：\(annotation.detail)")
-                        .font(.caption)
-                        .foregroundStyle(.purple)
+                if !appLine.isEmpty {
+                    Text("来源：\(appLine)").font(.callout)
+                }
+                if significantDevices.count > 1 {
+                    Text("设备：\(deviceLine)").font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
+            ForEach(viewModel.annotations(in: week)) { annotation in
+                Text("◆ \(annotation.date.formatted(.dateTime.month().day())) \(annotation.title)：\(annotation.detail)")
+                    .font(.caption)
+                    .foregroundStyle(Theme.marker)
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .card()
     }
 
     private var dateRange: String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "M月d日"
         let end = week.weekStart.addingTimeInterval(6 * 24 * 60 * 60)
-        return "\(formatter.string(from: week.weekStart)) – \(formatter.string(from: end))"
+        return "\(Formatters.monthDay(week.weekStart)) – \(Formatters.monthDay(end))"
     }
 
     private var overview: String {

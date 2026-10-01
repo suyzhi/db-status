@@ -12,6 +12,11 @@ struct CalibrationInputDevice: Sendable, Equatable, Identifiable {
         transportType != kAudioDeviceTransportTypeBuiltIn
             && transportType != kAudioDeviceTransportTypeVirtual
     }
+
+    var isContinuityCamera: Bool {
+        transportType == kAudioDeviceTransportTypeContinuityCaptureWired
+            || transportType == kAudioDeviceTransportTypeContinuityCaptureWireless
+    }
 }
 
 enum CalibrationMicrophoneStatus: Sendable, Equatable {
@@ -223,8 +228,13 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
         }
     }
 
+    /// 默认选中最可能接着 EM258 的输入：耳机孔麦克风 > USB 声卡 > 其他外接设备。
+    /// iPhone 连续互通麦克风虽然算“外接”，但不可能是 EM258，排在最后。
     func preferredDevice() -> CalibrationInputDevice? {
-        devices.first(where: \.isExternal) ?? devices.first
+        devices.first { $0.uid == "BuiltInHeadphoneInputDevice" }
+            ?? devices.first { $0.transportType == kAudioDeviceTransportTypeUSB }
+            ?? devices.first { $0.isExternal && !$0.isContinuityCamera }
+            ?? devices.first
     }
 
     func select(device: CalibrationInputDevice) {
@@ -651,6 +661,8 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
         return deviceIDs.compactMap { deviceID in
             guard inputChannelCount(deviceID: deviceID) > 0,
                   let uid = readString(deviceID: deviceID, selector: kAudioDevicePropertyDeviceUID),
+                  // 本应用自己创建的系统音频 / 按 App 统计聚合设备不是麦克风。
+                  !uid.hasPrefix("com.volumemonitor."),
                   let name = readString(deviceID: deviceID, selector: kAudioObjectPropertyName) else {
                 return nil
             }

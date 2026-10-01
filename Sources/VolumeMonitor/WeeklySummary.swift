@@ -75,14 +75,28 @@ enum WeeklySummaryBuilder {
         calendar: Calendar = calendar
     ) -> [WeeklySummary] {
         var weeks: [Date: WeeklySummary] = [:]
+        // 日历计算很慢（每次数微秒），5 万条分钟记录逐条算会卡界面：按本地日期缓存。
+        var dayCache: [Int: (start: Date, day: Int)] = [:]
+        let timeZone = calendar.timeZone
         for bucket in buckets where bucket.measuredDuration > 0 {
-            let start = weekStart(for: bucket.minute, calendar: calendar)
+            let local = bucket.minute.timeIntervalSince1970 + Double(timeZone.secondsFromGMT(for: bucket.minute))
+            let dayKey = Int((local / 86_400).rounded(.down))
+            let cached: (start: Date, day: Int)
+            if let hit = dayCache[dayKey] {
+                cached = hit
+            } else {
+                let start = weekStart(for: bucket.minute, calendar: calendar)
+                let day = min(6, max(0, calendar.dateComponents(
+                    [.day],
+                    from: start,
+                    to: calendar.startOfDay(for: bucket.minute)
+                ).day ?? 0))
+                cached = (start, day)
+                dayCache[dayKey] = cached
+            }
+            let start = cached.start
+            let day = cached.day
             var summary = weeks[start] ?? WeeklySummary(weekStart: start)
-            let day = min(6, max(0, calendar.dateComponents(
-                [.day],
-                from: start,
-                to: calendar.startOfDay(for: bucket.minute)
-            ).day ?? 0))
             summary.energy += bucket.normalizedEnergyAt80Seconds
             summary.listeningSeconds += bucket.measuredDuration
             summary.dailyEnergy[day] += bucket.normalizedEnergyAt80Seconds
