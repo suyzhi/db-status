@@ -9,17 +9,20 @@ enum MenuBarHostStatus {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var popoverVC: PopoverViewController!
     private var settingsWindowController: SettingsWindowController?
     private var calibrationWindowController: CalibrationWizardWindowController?
+    private var weeklySummaryWindowController: WeeklySummaryWindowController?
+    private var archiveTimer: Timer?
     private var timer: Timer?
     private var lastStatusBarText = ""
     private var lastStatusBarColorKey = ""
 
     private let audioMonitor = SystemAudioLevelMonitor()
+    private let appAttribution = AppAudioAttributionMonitor()
     private let outputMonitor = OutputDeviceMonitor()
     private let preferences = AppPreferences.shared
     private lazy var profileRepository = ProfileRepository()
@@ -39,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popoverVC = PopoverViewController(
             audioMonitor: audioMonitor,
+            appAttribution: appAttribution,
             outputMonitor: outputMonitor,
             profiles: profileRepository,
             exposure: exposureService,
@@ -47,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         popoverVC.onShowSettings = { [weak self] in self?.showSettings() }
         popoverVC.onShowCalibration = { [weak self] in self?.showCalibration() }
+        popoverVC.onShowWeeklySummary = { [weak self] in self?.showWeeklySummary() }
         popoverVC.onQuit = { NSApplication.shared.terminate(nil) }
         popoverVC.onMonitoringChanged = { [weak self] enabled in
             self?.setMonitoringEnabled(enabled, forceRestart: enabled)
@@ -59,19 +64,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? .applicationDefined
             : .transient
         popover.animates = true
+        popover.delegate = self
 
-        if preferences.monitoringEnabled { audioMonitor.start() }
-        refreshData()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshData() }
+        if preferences.monitoringEnabled {
+            audioMonitor.start()
+            appAttribution.start()
         }
-        timer?.tolerance = 0.025
+        refreshData()
+        setRefreshInterval(Self.backgroundRefreshInterval)
+
+        // 已结束的周写入永久存档；分钟明细 8 周后裁剪，存档在此之前早已完成。
+        WeeklySummaryStore.shared.archiveCompletedWeeks()
+        archiveTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { _ in
+            Task { @MainActor in WeeklySummaryStore.shared.archiveCompletedWeeks() }
+        }
 
         // 默认只在用户点击菜单栏图标时弹出，避免启动/自启时打扰。
         // （从 Finder 打开时也保持安静：状态栏图标本身即是反馈。）
         // VM_OPEN_POPOVER=1 供调试/验证用：启动即弹出。
         if ProcessInfo.processInfo.environment["VM_OPEN_POPOVER"] == "1" {
             presentPopoverWhenReady()
+        }
+        // VM_OPEN_WEEKLY=1 供调试/验证用：启动即打开每周小结。
+        if ProcessInfo.processInfo.environment["VM_OPEN_WEEKLY"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.showWeeklySummary()
+            }
         }
         // VM_OPEN_SETTINGS=1 供调试/验证用：启动即打开设置窗口。
         if ProcessInfo.processInfo.environment["VM_OPEN_SETTINGS"] == "1" {
@@ -89,6 +107,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 弹窗打开时 10 Hz 刷新数字；平时只需更新菜单栏，1 Hz 足够。
+    /// 声暴露由音频线程累计能量，刷新频率不影响积分精度。
+    private static let popoverRefreshInterval: TimeInterval = 0.1
+    private static let backgroundRefreshInterval: TimeInterval = 1.0
+
+    private func setRefreshInterval(_ interval: TimeInterval) {
+        guard timer?.timeInterval != interval else { return }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshData() }
+        }
+        timer?.tolerance = interval * 0.25
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        setRefreshInterval(Self.popoverRefreshInterval)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        setRefreshInterval(Self.backgroundRefreshInterval)
+    }
+
     @objc private func windowDidBecomeKey(_ notification: Notification) {
         OverlayScrollers.apply(to: notification.object as? NSWindow)
     }
@@ -99,6 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         exposureService.flush()
         outputMonitor.stop()
         audioMonitor.stop()
+        appAttribution.stop()
         calibrationWindowController?.stopCalibration()
     }
 
@@ -163,8 +204,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exposureService.requestNotificationAuthorization()
             if forceRestart { audioMonitor.stop() }
             audioMonitor.start()
+            appAttribution.start()
         } else {
             audioMonitor.stop()
+            appAttribution.stop()
         }
         refreshData()
     }
@@ -178,11 +221,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 calibrationStore: calibrationStore,
                 onMonitoringChanged: { [weak self] enabled in
                     self?.setMonitoringEnabled(enabled)
-                }
+                },
+                onShowWeeklySummary: { [weak self] in self?.showWeeklySummary() }
             )
         }
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    private func showWeeklySummary() {
+        if weeklySummaryWindowController == nil {
+            weeklySummaryWindowController = WeeklySummaryWindowController(profiles: profileRepository)
+        }
+        weeklySummaryWindowController?.showWindow(nil)
+        weeklySummaryWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 

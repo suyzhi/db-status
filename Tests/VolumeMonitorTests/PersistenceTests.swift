@@ -210,3 +210,26 @@ import Testing
         #expect(LocalDataStore(directoryURL: directory).profiles.isEmpty)
     }
 }
+
+extension PersistenceTests {
+    @Test func annotationsPersistInDateOrder() throws {
+        let (store, directory) = makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let later = ExposureAnnotation(
+            date: Date(timeIntervalSince1970: 2_000),
+            title: "校准偏移变更",
+            detail: "+10.0 dB → 无"
+        )
+        let earlier = ExposureAnnotation(
+            date: Date(timeIntervalSince1970: 1_000),
+            title: "保存 EM258 校准",
+            detail: "测试"
+        )
+        try store.addAnnotation(later)
+        try store.addAnnotation(earlier)
+
+        let reloaded = LocalDataStore(directoryURL: directory)
+        #expect(reloaded.annotations.map(\.id) == [earlier.id, later.id])
+        #expect(reloaded.annotations.last?.detail == "+10.0 dB → 无")
+    }
+}

@@ -68,8 +68,8 @@ final class CalibrationStore {
     }
 
     func save(_ profile: CalibrationProfile) throws {
-        guard profile.absoluteCalibrationMode == .estimatedFromHeadphoneModel else {
-            throw CalibrationStoreError.invalidProfile("当前版本尚未实现绝对声学参考模式")
+        if let issue = profile.absoluteValidationIssue {
+            throw CalibrationStoreError.invalidProfile(issue)
         }
         guard profile.isUsable else {
             let reason = profile.validationIssues.first ?? "没有通过有效性检查"

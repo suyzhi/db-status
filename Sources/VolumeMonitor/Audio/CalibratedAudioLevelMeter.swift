@@ -26,7 +26,8 @@ final class CalibratedAudioLevelMeter {
     private let realScratch: UnsafeMutablePointer<Float>
     private let imaginaryScratch: UnsafeMutablePointer<Float>
 
-    private var latestChannelRMS: [Float]
+    /// 最近一个分析窗口的均方（各声道按能量平均）。
+    private var latestMeanSquare = 0.0
     private(set) var processedWindowCount = 0
 
     init?(
@@ -61,7 +62,6 @@ final class CalibratedAudioLevelMeter {
         imaginaryScratch = .allocate(capacity: fftSize)
         realScratch.initialize(repeating: 0, count: fftSize)
         imaginaryScratch.initialize(repeating: 0, count: fftSize)
-        latestChannelRMS = Array(repeating: 0, count: channelCount)
 
         let aWeighting = AWeightingMeter(sampleRate: sampleRate, channelCount: 1)
         binPowerCorrections = (0...fftSize / 2).map { bin in
@@ -83,12 +83,21 @@ final class CalibratedAudioLevelMeter {
         for channel in 0..<channelCount {
             pendingSamples[channel].removeAll(keepingCapacity: true)
             pendingStart[channel] = 0
-            latestChannelRMS[channel] = 0
         }
+        latestMeanSquare = 0
         processedWindowCount = 0
     }
 
     func measure(_ audioBufferList: UnsafePointer<AudioBufferList>) -> (rms: Float, peak: Float)? {
+        measure(audioBufferList) { _, _ in }
+    }
+
+    /// 每完成一个分析窗口回调一次 `onWindow(均方, 该窗口代表的帧数)`，供能量积分；
+    /// 返回最近窗口的 RMS 与本块峰值。尚未攒够第一个窗口时返回 nil。
+    func measure(
+        _ audioBufferList: UnsafePointer<AudioBufferList>,
+        onWindow: (Double, Int) -> Void
+    ) -> (rms: Float, peak: Float)? {
         let buffers = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: audioBufferList)
         )
@@ -126,22 +135,26 @@ final class CalibratedAudioLevelMeter {
         while pendingSamples.indices.allSatisfy({
             pendingSamples[$0].count - pendingStart[$0] >= fftSize
         }) {
+            // 左右声道按能量平均：普通音乐左右基本一致，取最大值会让偏声道内容虚高。
+            var powerSum = 0.0
             for channel in 0..<channelCount {
-                latestChannelRMS[channel] = analyzeWindow(
+                let rms = Double(analyzeWindow(
                     pendingSamples[channel],
                     start: pendingStart[channel]
-                )
+                ))
+                powerSum += rms * rms
                 pendingStart[channel] += hopSize
             }
+            latestMeanSquare = powerSum / Double(channelCount)
+            onWindow(latestMeanSquare, hopSize)
             processedWindowCount += 1
             processedAnyWindow = true
         }
         if processedAnyWindow { compactPendingSamples() }
 
-        guard processedWindowCount > 0, let loudest = latestChannelRMS.max(), loudest.isFinite else {
-            return nil
-        }
-        return (rms: min(max(loudest, 0), 1), peak: min(max(peak, 0), 1))
+        guard processedWindowCount > 0, latestMeanSquare.isFinite else { return nil }
+        let rms = Float(sqrt(max(0, latestMeanSquare)))
+        return (rms: min(max(rms, 0), 1), peak: min(max(peak, 0), 1))
     }
 
     private func compactPendingSamples() {

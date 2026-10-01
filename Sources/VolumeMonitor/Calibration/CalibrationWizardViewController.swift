@@ -8,6 +8,7 @@ enum CalibrationWizardStep: Int, CaseIterable {
     case frequency
     case volume
     case validation
+    case absolute
 
     var title: String {
         switch self {
@@ -15,7 +16,8 @@ enum CalibrationWizardStep: Int, CaseIterable {
         case .installation: "固定耳机和麦克风"
         case .frequency: "自动频响测试"
         case .volume: "自动音量测试"
-        case .validation: "验证并保存"
+        case .validation: "验证"
+        case .absolute: "手机对标"
         }
     }
 }
@@ -39,10 +41,14 @@ final class CalibrationWizardViewModel: ObservableObject {
     @Published var frequencyResult: FrequencySweepResult?
     @Published var volumeResult: VolumeSweepResult?
     @Published var validationResult: RelativeValidationResult?
+    @Published var acousticMeasurement: AcousticReferenceMeasurement?
+    @Published var phoneReadingText = ""
+    @Published var phoneDescription = "iPhone · NIOSH SLM"
     @Published var saved = false
 
     let microphone = CalibrationMicrophoneMonitor()
     private let toneGenerator = CalibrationToneGenerator()
+    private let noisePlayer = CalibrationNoisePlayer()
     private let outputMonitor: OutputDeviceMonitor
     private let profiles: ProfileRepository
     private let calibrationStore: CalibrationStore
@@ -85,6 +91,41 @@ final class CalibrationWizardViewModel: ObservableObject {
         )
     }
 
+    var speakerAvailable: Bool { CalibrationNoisePlayer.builtInSpeakerDeviceID() != nil }
+
+    var phoneReadingDBA: Double? {
+        let text = phoneReadingText.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "，", with: ".")
+        guard let value = Double(text), (40...110).contains(value) else { return nil }
+        return value
+    }
+
+    /// 手机对标得到的：参考音量下数字 RMS 0 dBFS 的 1 kHz 信号在耳道口的声压。
+    var measuredFullScaleAtReference: Double? {
+        guard let volumeResult, let acousticMeasurement, let phoneReadingDBA else { return nil }
+        return volumeResult.referenceNormalizedLevelDBFS
+            + (phoneReadingDBA - acousticMeasurement.microphoneAWeightedDBFS)
+    }
+
+    /// 同一点按耳机规格（灵敏度 × 最大输出）加实测音量曲线推算的值，用来交叉核对。
+    var specFullScaleAtReference: Double? {
+        guard let profile = headphoneProfile,
+              let sensitivity = profile.sensitivity?.dbPerVolt,
+              let source = profile.outputSource,
+              let volumeResult,
+              let fullVolume = volumeResult.points.first(where: { abs($0.systemVolume - 1) < 0.002 }),
+              let spec100 = LevelEstimator.headphoneModelFullScaleDBA(
+                  at: 1,
+                  sensitivityDBV: sensitivity,
+                  source: OutputSourceProfile(maxOutputVRMS: source.maxOutputVRMS, volumeCurve: [])
+              ) else { return nil }
+        let shift = frequencyResult.flatMap { result in
+            FrequencyResponseInterpolator(points: result.points)?
+                .responseDB(at: profile.sensitivityReferenceHz ?? 1_000)
+        } ?? 0
+        return Double(spec100) - shift - fullVolume.relativeDB
+    }
+
     var prerequisiteIssue: String? {
         guard outputDevice.uid != nil else { return "无法读取当前输出设备 UID" }
         guard let profile = headphoneProfile, profile.isConfirmed else {
@@ -121,6 +162,8 @@ final class CalibrationWizardViewModel: ObservableObject {
                 frequencyResult = nil
                 volumeResult = nil
                 validationResult = nil
+                acousticMeasurement = nil
+                phoneReadingText = ""
                 saved = false
             }
             prepare()
@@ -207,15 +250,25 @@ final class CalibrationWizardViewModel: ObservableObject {
                 // 测试音往往连环境噪声都压不过。这里按“当前音量”换算
                 // 90 dBA 模型封顶（数字电平另有 -6 dBFS 钳制），让低音量点
                 // 也有足够响的测试音，而不必要求环境绝对安静。
+                let modelFullScale: (Float) -> Float? = { volume in
+                    LevelEstimator.headphoneModelFullScaleDBA(
+                        at: volume,
+                        sensitivityDBV: sensitivity,
+                        source: source
+                    )
+                }
                 volumeResult = try await measurementEngine.measureVolumeCurve(
                     outputDeviceUID: uid,
                     testSignalRMSDBFS: frequencyResult.testSignalRMSDBFS,
                     maxSignalAtVolume: { volume in
-                        LevelEstimator.headphoneModelFullScaleDBA(
-                            at: volume,
-                            sensitivityDBV: sensitivity,
-                            source: source
-                        ).map { CalibrationToneGenerator.maximumCalibrationToneDBA - Double($0) }
+                        modelFullScale(volume).map {
+                            CalibrationToneGenerator.maximumCalibrationToneDBA - Double($0)
+                        }
+                    },
+                    comfortableSignalAtVolume: { volume in
+                        modelFullScale(volume).map {
+                            CalibrationToneGenerator.comfortableCalibrationToneDBA - Double($0)
+                        }
                     },
                     progress: updateProgress
                 )
@@ -233,6 +286,33 @@ final class CalibrationWizardViewModel: ObservableObject {
         errorMessage = ""
         if step == .frequency { beginFrequencyTest() }
         if step == .volume || step == .validation { beginVolumeTest() }
+        if step == .absolute { beginAcousticReference() }
+    }
+
+    func goToAbsoluteStep() {
+        errorMessage = ""
+        step = .absolute
+    }
+
+    func beginAcousticReference() {
+        activeTask?.cancel()
+        acousticMeasurement = nil
+        activeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            isBusy = true
+            errorMessage = ""
+            defer { isBusy = false }
+            do {
+                acousticMeasurement = try await measurementEngine.measureAcousticReference(
+                    noisePlayer: noisePlayer,
+                    progress: updateProgress
+                )
+            } catch is CancellationError {
+                progressMessage = "测试已取消"
+            } catch {
+                handleMeasurementError(error)
+            }
+        }
     }
 
     func retryVolumeCurve() {
@@ -243,7 +323,7 @@ final class CalibrationWizardViewModel: ObservableObject {
         beginVolumeTest()
     }
 
-    func saveCalibration() {
+    func saveCalibration(useAcousticReference: Bool = false) {
         guard canSaveCalibration else {
             errorMessage = "校准验证误差超过 2 dB，不能保存；请重新测试音量曲线。"
             return
@@ -259,6 +339,23 @@ final class CalibrationWizardViewModel: ObservableObject {
               let input = microphone.snapshot.device,
               let inputChainFingerprint = microphone.inputChainFingerprint,
               let quality = currentQuality else { return }
+        var acousticReference: AcousticReferenceCalibration?
+        if useAcousticReference {
+            guard let acousticMeasurement,
+                  let phoneReadingDBA,
+                  let fullScale = measuredFullScaleAtReference else {
+                errorMessage = "请先完成粉红噪声测量，并输入 40~110 之间的手机读数"
+                return
+            }
+            acousticReference = AcousticReferenceCalibration(
+                referenceMeterDBA: phoneReadingDBA,
+                microphoneAWeightedDBFS: acousticMeasurement.microphoneAWeightedDBFS,
+                microphoneStabilityDB: acousticMeasurement.stabilityDB,
+                referenceDescription: phoneDescription.trimmingCharacters(in: .whitespaces),
+                measuredAt: .now,
+                fullScaleRMSSPLAtReferenceVolume: fullScale
+            )
+        }
         let calibration = CalibrationProfile(
             headphoneProfileID: profile.id,
             headphoneName: profile.name,
@@ -273,12 +370,21 @@ final class CalibrationWizardViewModel: ObservableObject {
             volumePoints: volumeResult.points,
             frequencyCalibrationValid: true,
             volumeCalibrationValid: true,
-            absoluteCalibrationMode: .estimatedFromHeadphoneModel,
+            absoluteCalibrationMode: acousticReference == nil ? .estimatedFromHeadphoneModel : .acousticReference,
             microphoneResponse: .em258NominalUncorrected,
-            quality: quality
+            quality: quality,
+            acousticReference: acousticReference
         )
         do {
             try calibrationStore.save(calibration)
+            let absolute = acousticReference.map {
+                String(format: "绝对值：手机对标实测（%@，50%% 音量满幅 %.1f dB）",
+                       $0.referenceDescription, $0.fullScaleRMSSPLAtReferenceVolume)
+            } ?? "绝对值：按耳机规格换算"
+            try? LocalDataStore.shared.addAnnotation(ExposureAnnotation(
+                title: "保存 EM258 校准",
+                detail: "\(profile.name) · 音量曲线 \(volumeResult.points.count) 点 · \(absolute)"
+            ))
             saved = true
             progressMessage = "校准已保存；现在可以拔掉 EM258"
             microphone.stop()
@@ -294,6 +400,7 @@ final class CalibrationWizardViewModel: ObservableObject {
         activeTask = nil
         measurementEngine.cancel()
         toneGenerator.stop()
+        noisePlayer.stop()
         microphone.stop()
     }
 
@@ -374,9 +481,9 @@ final class CalibrationWizardWindowController: NSWindowController, NSWindowDeleg
             rootView: CalibrationWizardView(viewModel: viewModel)
         )
         let window = NSWindow(contentViewController: hostingController)
-        window.title = "EM258 耳机相对校准"
+        window.title = "EM258 耳机校准"
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 640, height: 560))
+        window.setContentSize(NSSize(width: 680, height: 620))
         window.center()
         super.init(window: window)
         window.delegate = self
@@ -416,7 +523,7 @@ struct CalibrationWizardView: View {
                             .clipShape(Circle())
                         Text(item.title).font(.caption2).lineLimit(1)
                     }
-                    if item != .validation { Divider().frame(width: 30) }
+                    if item != CalibrationWizardStep.allCases.last { Divider().frame(width: 22) }
                 }
             }
 
@@ -428,6 +535,7 @@ struct CalibrationWizardView: View {
                 case .frequency: FrequencyCalibrationStep(viewModel: viewModel)
                 case .volume: VolumeCalibrationStep(viewModel: viewModel)
                 case .validation: ValidationCalibrationStep(viewModel: viewModel)
+                case .absolute: AbsoluteCalibrationStep(viewModel: viewModel)
                 }
             }
             Spacer()
@@ -442,7 +550,7 @@ struct CalibrationWizardView: View {
             }
         }
         .padding(24)
-        .frame(minWidth: 600, minHeight: 520)
+        .frame(minWidth: 640, minHeight: 580)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { viewModel.prepare() }
     }
@@ -558,8 +666,8 @@ private struct VolumeCalibrationStep: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("自动音量测试").font(.title2.bold())
-            Text("保持 EM258 和耳机位置不动，软件将在 30%、50%、70% 音量测量 1 kHz。")
-            Text("这里记录的只是相对于 50% 的真实声压变化，不会把麦克风 dBFS 当作绝对 SPL。")
+            Text("保持 EM258 和耳机位置不动，软件将在 25% 到 100% 共 7 个音量点测量 1 kHz，约 1 分钟。")
+            Text("测到 100% 才能不依赖估算曲线换算绝对声压。高音量点会先用较轻的测试音（约 80 dB），整个过程不会超过 90 dB。")
                 .font(.callout).foregroundStyle(.secondary)
             Button(viewModel.isBusy ? "测试中…" : "开始音量测试") {
                 viewModel.beginVolumeTest()
@@ -579,8 +687,7 @@ private struct ValidationCalibrationStep: View {
                 Text("耳机：\(viewModel.headphoneProfile?.name ?? "—")")
                 Text("输出设备：\(viewModel.outputDevice.name ?? "—")")
                 Label("频率响应已实测（9 点）", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                Label("系统音量曲线已实测（3 点）", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                Label("绝对声压仍使用耳机参数估算", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Label("系统音量曲线已实测（\(viewModel.volumeResult?.points.count ?? 0) 点，25%~100%）", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 Label(validationStatus(validation.absoluteErrorDB), systemImage: validationIcon(validation.absoluteErrorDB))
                     .foregroundStyle(validationColor(validation.absoluteErrorDB))
                 if let quality = viewModel.currentQuality {
@@ -593,11 +700,15 @@ private struct ValidationCalibrationStep: View {
                 }
                 Text("EM258：无个体频响校准文件")
                     .font(.caption).foregroundStyle(.secondary)
+                Text("下一步用手机给 EM258 定刻度，得到耳边的实测绝对声压（推荐）；跳过则绝对值按耳机灵敏度和最大输出估算。")
+                    .font(.callout).foregroundStyle(.secondary)
                 HStack {
-                    Button(viewModel.saved ? "已保存" : "保存校准") {
+                    Button("下一步：手机对标") { viewModel.goToAbsoluteStep() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!viewModel.canSaveCalibration)
+                    Button(viewModel.saved ? "已保存" : "跳过，按耳机参数保存") {
                         viewModel.saveCalibration()
                     }
-                    .buttonStyle(.borderedProminent)
                     .disabled(!viewModel.canSaveCalibration)
                     if validation.absoluteErrorDB > 2.0 {
                         Button("重新测试音量曲线") { viewModel.retryVolumeCurve() }
@@ -625,5 +736,82 @@ private struct ValidationCalibrationStep: View {
         if error <= 1.0 { return .green }
         if error <= 2.0 { return .orange }
         return .red
+    }
+}
+
+private struct AbsoluteCalibrationStep: View {
+    @ObservedObject var viewModel: CalibrationWizardViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("手机对标绝对声压").font(.title2.bold())
+            if !viewModel.speakerAvailable {
+                Text("找不到 MacBook 内置扬声器，这一步无法进行；可以按耳机参数保存。")
+                    .foregroundStyle(.orange)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("1. 摘下耳机放一边，但**耳机和 EM258 都保持插在转接头上**（否则系统会换成内置麦克风）。")
+                Text("2. 把 EM258 用胶带贴在手机底部麦克风孔旁边，一起朝向 MacBook 扬声器，距离 30~50 cm，放在桌上不要手拿。")
+                Text("3. 手机打开 NIOSH SLM（iPhone）或其他声级计 App，设为 A 计权。")
+                Text("4. 点击下方按钮：软件会从内置扬声器播放约 20 秒粉红噪声，读数稳定后记下手机中间的大数字。")
+            }
+            .font(.callout)
+            Text("手机自带麦克风作参考，精度约 ±2 dB。不要把 EM258 插到手机上。")
+                .font(.caption).foregroundStyle(.secondary)
+
+            Button(viewModel.isBusy ? "测量中…" : "播放粉红噪声并测量") {
+                viewModel.beginAcousticReference()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(viewModel.isBusy || !viewModel.speakerAvailable)
+
+            if let measurement = viewModel.acousticMeasurement {
+                Text(String(
+                    format: "EM258：%.2f dBFS(A)，波动 %.2f dB，信噪比 %.1f dB",
+                    measurement.microphoneAWeightedDBFS,
+                    measurement.stabilityDB,
+                    measurement.snrDB
+                ))
+                .font(.callout).monospacedDigit()
+                HStack {
+                    TextField("手机读数 dBA", text: $viewModel.phoneReadingText)
+                        .frame(width: 120)
+                    TextField("手机型号 · App", text: $viewModel.phoneDescription)
+                }
+                comparison
+            }
+
+            HStack {
+                Button(viewModel.saved ? "已保存" : "保存校准（使用实测绝对值）") {
+                    viewModel.saveCalibration(useAcousticReference: true)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(viewModel.saved || viewModel.measuredFullScaleAtReference == nil)
+                Button("不用手机，按耳机参数保存") {
+                    viewModel.saveCalibration()
+                }
+                .disabled(viewModel.saved || viewModel.isBusy || !viewModel.canSaveCalibration)
+            }
+        }
+    }
+
+    @ViewBuilder private var comparison: some View {
+        if let measured = viewModel.measuredFullScaleAtReference {
+            if let spec = viewModel.specFullScaleAtReference {
+                let delta = measured - spec
+                Text(String(format: "50%% 音量满幅声压：实测 %.1f dB，按耳机规格推算 %.1f dB，相差 %+.1f dB", measured, spec, delta))
+                    .font(.callout).monospacedDigit()
+                    .foregroundStyle(abs(delta) > 6 ? .orange : .primary)
+                if abs(delta) > 6 {
+                    Text("差异超过 6 dB：请确认手机读数、EM258 贴在手机麦克风旁、两者离扬声器的距离一致。确认无误仍可保存。")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+            } else {
+                Text(String(format: "50%% 音量满幅声压：实测 %.1f dB", measured))
+                    .font(.callout).monospacedDigit()
+            }
+        } else if !viewModel.phoneReadingText.isEmpty {
+            Text("请输入 40~110 之间的数字").font(.caption).foregroundStyle(.orange)
+        }
     }
 }

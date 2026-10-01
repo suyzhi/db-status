@@ -358,8 +358,9 @@ import Testing
             frequencyCalibrationApplied: true
         ))
 
-        // 50% model reference is 90 dB full-scale. Measured 70% delta is +8 dB.
-        #expect(abs(estimate.estimatedLevelDBA - 63) <= 0.001)
+        // 50% model reference is 90 dB for a full-scale sine (93.01 dB per 0 dBFS RMS).
+        // Measured 70% delta is +8 dB.
+        #expect(abs(estimate.estimatedLevelDBA - 66.0103) <= 0.001)
         #expect(estimate.volumeCalibrationApplied)
         #expect(estimate.frequencyCalibrationApplied)
         #expect(estimate.absoluteLevelIsEstimated)

@@ -3,7 +3,7 @@ import Testing
 @testable import VolumeMonitor
 
 @Suite struct LevelEstimatorTests {
-    @Test func twoVoltOutputAddsSixDecibels() throws {
+    @Test func twoVoltOutputAddsSixDecibelsPlusSineCrest() throws {
         let profile = wiredProfile(
             sensitivity: .dbPerVolt(100),
             maxVRMS: 2,
@@ -18,7 +18,7 @@ import Testing
             rmsAWeightedDBFS: 0,
             profile: profile
         ))
-        #expect(abs(estimate.estimatedLevelDBA - 106.0206) <= 0.001)
+        #expect(abs(estimate.estimatedLevelDBA - 109.0309) <= 0.001)
     }
 
     @Test func milliwattSensitivityUsesImpedance() throws {
@@ -36,7 +36,7 @@ import Testing
             rmsAWeightedDBFS: 0,
             profile: profile
         ))
-        #expect(abs(estimate.estimatedLevelDBA - 114.9485) <= 0.001)
+        #expect(abs(estimate.estimatedLevelDBA - 117.9588) <= 0.001)
     }
 
     @Test func calibrationOffsetIsApplied() throws {
@@ -48,7 +48,7 @@ import Testing
             rmsAWeightedDBFS: -10,
             profile: profile
         ))
-        #expect(abs(estimate.estimatedLevelDBA - 85.5) <= 0.001)
+        #expect(abs(estimate.estimatedLevelDBA - 88.5103) <= 0.001)
         #expect(estimate.confidence == .calibrated)
     }
 

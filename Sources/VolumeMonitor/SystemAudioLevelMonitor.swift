@@ -1,3 +1,4 @@
+import Accelerate
 import CoreAudio
 import Darwin
 import Foundation
@@ -93,6 +94,9 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
     private var ioProcID: AudioDeviceIOProcID?
     private var aWeightingMeter = AWeightingMeter(sampleRate: 48_000, channelCount: 2)
     private var calibratedMeter: CalibratedAudioLevelMeter?
+    private let integrator = LoudnessIntegrator()
+    /// 仅音频回调使用：上一块是否为纯静音。
+    private var previousBlockWasSilent = false
 
     private var status: AudioCaptureStatus = .idle
     private var shouldRun = false
@@ -296,6 +300,8 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         tapID = AudioObjectID(kAudioObjectUnknown)
         aWeightingMeter.reset()
         calibratedMeter = nil
+        integrator.resetAudioThreadState()
+        previousBlockWasSilent = false
         resetAtomicLevels()
 
         stateLock.lock()
@@ -429,31 +435,82 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         return result == noErr && processObjectID != kAudioObjectUnknown ? processObjectID : nil
     }
 
+    /// 主线程：取走自上次以来累计的有声能量（用于声暴露积分与 LAFmax）。
+    func drainLoudness() -> LoudnessIntegrator.Drained {
+        integrator.drain()
+    }
+
     fileprivate func processAudioBufferList(_ audioBufferList: UnsafePointer<AudioBufferList>?) {
         guard let audioBufferList else { return }
-        // 校准引擎一旦产出窗口就只走 FFT 路径，避免每个回调都白跑一遍
-        // 会被丢弃的逐样本 A 加权标量循环；仅在引擎尚未就绪时回退。
-        let calibratedLevels = calibratedMeter?.measure(audioBufferList)
-        let levels: (rms: Float, peak: Float)
-        if let calibratedLevels {
-            levels = calibratedLevels
-        } else {
-            guard let standardLevels = aWeightingMeter.measure(audioBufferList) else { return }
-            levels = standardLevels
+        let sampleRate = aWeightingMeter.sampleRate
+        let block = Self.blockPeakAndFrames(audioBufferList)
+        guard block.frames > 0 else { return }
+
+        if block.peak == 0 {
+            // 没有任何 App 出声时 tap 仍持续送零：跳过 IIR 与 FFT，只让 Fast 计权衰减。
+            if !previousBlockWasSilent {
+                aWeightingMeter.reset()
+                calibratedMeter?.reset()
+                previousBlockWasSilent = true
+            }
+            publishLevels(
+                fastMeanSquare: integrator.addSilence(frames: block.frames, sampleRate: sampleRate),
+                blockPeak: 0
+            )
+            return
         }
-        vm_atomic_u32_store(calibrationAppliedBits, calibratedLevels == nil ? 0 : 1)
+        previousBlockWasSilent = false
 
-        let oldRMS = Float(bitPattern: vm_atomic_u32_load(rmsLinearBits))
+        // 校准引擎每个 FFT 窗口回调一次能量；窗口攒满之前（约 85 ms）用标准 A 加权兜底。
+        var calibratedReady = false
+        if let calibratedMeter {
+            let integrator = integrator
+            calibratedReady = calibratedMeter.measure(audioBufferList) { meanSquare, frames in
+                integrator.add(meanSquare: meanSquare, frames: frames, sampleRate: sampleRate)
+            } != nil
+        }
+        if !calibratedReady {
+            guard let standard = aWeightingMeter.measure(audioBufferList) else { return }
+            integrator.add(
+                meanSquare: Double(standard.rms) * Double(standard.rms),
+                frames: standard.frames,
+                sampleRate: sampleRate
+            )
+        }
+        vm_atomic_u32_store(calibrationAppliedBits, calibratedMeter == nil ? 0 : 1)
+        publishLevels(fastMeanSquare: integrator.fastMeanSquare, blockPeak: block.peak)
+    }
+
+    /// 显示用电平：Fast（125 ms）计权的 A 加权电平；峰值为未加权采样峰值，按块衰减。
+    private func publishLevels(fastMeanSquare: Double, blockPeak: Float) {
+        let fastRMS = Float(sqrt(max(0, fastMeanSquare)))
         let oldPeak = Float(bitPattern: vm_atomic_u32_load(peakLinearBits))
-        let smoothing: Float = levels.rms > oldRMS ? 0.55 : 0.16
-        let smoothedRMS = oldRMS + (levels.rms - oldRMS) * smoothing
-        let smoothedPeak = max(levels.peak, oldPeak * 0.82)
-
-        vm_atomic_u32_store(rmsLinearBits, smoothedRMS.bitPattern)
-        vm_atomic_u32_store(peakLinearBits, smoothedPeak.bitPattern)
-        vm_atomic_u32_store(rmsBits, Self.dbFS(fromLinear: smoothedRMS).bitPattern)
-        vm_atomic_u32_store(peakBits, Self.dbFS(fromLinear: smoothedPeak).bitPattern)
+        let heldPeak = max(blockPeak, oldPeak * 0.82)
+        vm_atomic_u32_store(rmsLinearBits, fastRMS.bitPattern)
+        vm_atomic_u32_store(peakLinearBits, heldPeak.bitPattern)
+        vm_atomic_u32_store(rmsBits, Self.dbFS(fromLinear: fastRMS).bitPattern)
+        vm_atomic_u32_store(peakBits, Self.dbFS(fromLinear: heldPeak).bitPattern)
         vm_atomic_u64_store(lastSampleBits, Self.monotonicTime().bitPattern)
+    }
+
+    private static func blockPeakAndFrames(
+        _ audioBufferList: UnsafePointer<AudioBufferList>
+    ) -> (peak: Float, frames: Int) {
+        let buffers = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: audioBufferList)
+        )
+        var peak: Float = 0
+        var frames = 0
+        for buffer in buffers {
+            guard let data = buffer.mData else { continue }
+            let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+            guard count > 0 else { continue }
+            var bufferPeak: Float = 0
+            vDSP_maxmgv(data.assumingMemoryBound(to: Float.self), 1, &bufferPeak, vDSP_Length(count))
+            peak = max(peak, bufferPeak)
+            frames = max(frames, count / max(1, Int(buffer.mNumberChannels)))
+        }
+        return (peak, frames)
     }
 
     private func readShouldRun() -> Bool {
@@ -553,217 +610,6 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         if isPermissionStatus(status) { return .permissionRequired(status) }
         if isAudioUnavailableStatus(status) { return .audioUnavailable(status) }
         return .startFailed(status)
-    }
-}
-
-struct BiquadCoefficients: Sendable {
-    let b0: Double
-    let b1: Double
-    let b2: Double
-    let a1: Double
-    let a2: Double
-
-    static func bilinear(
-        sampleRate: Double,
-        numerator: (Double, Double, Double),
-        denominator: (Double, Double, Double)
-    ) -> BiquadCoefficients {
-        let c = 2 * sampleRate
-        let c2 = c * c
-        let (b2s, b1s, b0s) = numerator
-        let (a2s, a1s, a0s) = denominator
-        let b0 = b2s * c2 + b1s * c + b0s
-        let b1 = -2 * b2s * c2 + 2 * b0s
-        let b2 = b2s * c2 - b1s * c + b0s
-        let a0 = a2s * c2 + a1s * c + a0s
-        let a1 = -2 * a2s * c2 + 2 * a0s
-        let a2 = a2s * c2 - a1s * c + a0s
-        return BiquadCoefficients(
-            b0: b0 / a0,
-            b1: b1 / a0,
-            b2: b2 / a0,
-            a1: a1 / a0,
-            a2: a2 / a0
-        )
-    }
-
-    func magnitude(frequency: Double, sampleRate: Double) -> Double {
-        let omega = -2 * Double.pi * frequency / sampleRate
-        let z1 = Complex(cos(omega), sin(omega))
-        let z2 = z1 * z1
-        let numerator = Complex(b0, 0) + z1 * b1 + z2 * b2
-        let denominator = Complex(1, 0) + z1 * a1 + z2 * a2
-        return (numerator / denominator).magnitude
-    }
-}
-
-private struct BiquadState {
-    let coefficients: BiquadCoefficients
-    var z1 = 0.0
-    var z2 = 0.0
-
-    mutating func process(_ input: Double) -> Double {
-        let output = coefficients.b0 * input + z1
-        z1 = coefficients.b1 * input - coefficients.a1 * output + z2
-        z2 = coefficients.b2 * input - coefficients.a2 * output
-        return output
-    }
-}
-
-private struct ChannelAWeightingFilter {
-    var sections: [BiquadState]
-    let gain: Double
-
-    mutating func process(_ input: Double) -> Double {
-        var output = input
-        for index in sections.indices {
-            output = sections[index].process(output)
-        }
-        return output * gain
-    }
-}
-
-final class AWeightingMeter {
-    let sampleRate: Double
-    private let coefficients: [BiquadCoefficients]
-    private let normalizationGain: Double
-    private var filters: [ChannelAWeightingFilter]
-
-    init(sampleRate: Double, channelCount: Int) {
-        self.sampleRate = sampleRate
-        let sectionCoefficients = Self.makeCoefficients(sampleRate: sampleRate)
-        coefficients = sectionCoefficients
-        let magnitudeAt1K = sectionCoefficients.reduce(1.0) {
-            $0 * $1.magnitude(frequency: 1_000, sampleRate: sampleRate)
-        }
-        let gain = magnitudeAt1K > 0 ? 1 / magnitudeAt1K : 1
-        normalizationGain = gain
-        filters = (0..<max(1, channelCount)).map { _ in
-            ChannelAWeightingFilter(
-                sections: sectionCoefficients.map { BiquadState(coefficients: $0) },
-                gain: gain
-            )
-        }
-    }
-
-    func reset() {
-        filters = filters.map { _ in
-            ChannelAWeightingFilter(
-                sections: coefficients.map { BiquadState(coefficients: $0) },
-                gain: normalizationGain
-            )
-        }
-    }
-
-    func frequencyResponseDB(at frequency: Double) -> Double {
-        let magnitude = coefficients.reduce(normalizationGain) {
-            $0 * $1.magnitude(frequency: frequency, sampleRate: sampleRate)
-        }
-        return 20 * log10(max(magnitude, .leastNonzeroMagnitude))
-    }
-
-    func measure(_ audioBufferList: UnsafePointer<AudioBufferList>) -> (rms: Float, peak: Float)? {
-        let buffers = UnsafeMutableAudioBufferListPointer(
-            UnsafeMutablePointer(mutating: audioBufferList)
-        )
-        var sumSquares = 0.0
-        var peak: Float = 0
-        var sampleCount = 0
-        var channelOffset = 0
-        var layoutInvalid = false
-
-        // 走 UnsafeMutableBufferPointer，避免实时线程上逐样本的数组边界检查。
-        filters.withUnsafeMutableBufferPointer { filterBuffer in
-            for buffer in buffers {
-                guard let data = buffer.mData else { continue }
-                let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
-                let channelCount = max(1, Int(buffer.mNumberChannels))
-                let frameCount = count / channelCount
-                guard frameCount > 0,
-                      channelOffset + channelCount <= filterBuffer.count else {
-                    layoutInvalid = true
-                    return
-                }
-                let samples = data.bindMemory(to: Float.self, capacity: count)
-
-                for frame in 0..<frameCount {
-                    let base = frame * channelCount
-                    for channel in 0..<channelCount {
-                        let sample = samples[base + channel]
-                        peak = max(peak, abs(sample))
-                        let weighted = filterBuffer[channelOffset + channel].process(Double(sample))
-                        sumSquares += weighted * weighted
-                    }
-                }
-                sampleCount += frameCount * channelCount
-                channelOffset += channelCount
-            }
-        }
-
-        guard !layoutInvalid, sampleCount > 0 else { return nil }
-        return (
-            rms: min(max(Float(sqrt(sumSquares / Double(sampleCount))), 0), 1),
-            peak: min(max(peak, 0), 1)
-        )
-    }
-
-    private static func makeCoefficients(sampleRate: Double) -> [BiquadCoefficients] {
-        let w1 = 2 * Double.pi * 20.598997
-        let w2 = 2 * Double.pi * 107.65265
-        let w3 = 2 * Double.pi * 737.86223
-        let w4 = 2 * Double.pi * 12_194.217
-        return [
-            .bilinear(
-                sampleRate: sampleRate,
-                numerator: (1, 0, 0),
-                denominator: (1, 2 * w1, w1 * w1)
-            ),
-            .bilinear(
-                sampleRate: sampleRate,
-                numerator: (0, 1, 0),
-                denominator: (1, w2 + w3, w2 * w3)
-            ),
-            .bilinear(
-                sampleRate: sampleRate,
-                numerator: (0, 1, 0),
-                denominator: (1, 2 * w4, w4 * w4)
-            )
-        ]
-    }
-}
-
-private struct Complex {
-    let real: Double
-    let imaginary: Double
-
-    init(_ real: Double, _ imaginary: Double) {
-        self.real = real
-        self.imaginary = imaginary
-    }
-
-    var magnitude: Double { hypot(real, imaginary) }
-
-    static func +(lhs: Complex, rhs: Complex) -> Complex {
-        Complex(lhs.real + rhs.real, lhs.imaginary + rhs.imaginary)
-    }
-
-    static func *(lhs: Complex, rhs: Complex) -> Complex {
-        Complex(
-            lhs.real * rhs.real - lhs.imaginary * rhs.imaginary,
-            lhs.real * rhs.imaginary + lhs.imaginary * rhs.real
-        )
-    }
-
-    static func *(lhs: Complex, rhs: Double) -> Complex {
-        Complex(lhs.real * rhs, lhs.imaginary * rhs)
-    }
-
-    static func /(lhs: Complex, rhs: Complex) -> Complex {
-        let denominator = rhs.real * rhs.real + rhs.imaginary * rhs.imaginary
-        return Complex(
-            (lhs.real * rhs.real + lhs.imaginary * rhs.imaginary) / denominator,
-            (lhs.imaginary * rhs.real - lhs.real * rhs.imaginary) / denominator
-        )
     }
 }
 

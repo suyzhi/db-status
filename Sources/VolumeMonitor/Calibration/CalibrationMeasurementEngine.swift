@@ -56,6 +56,13 @@ struct VolumeSweepResult: Sendable, Equatable {
     let testSignalRMSDBFS: Double
 }
 
+struct AcousticReferenceMeasurement: Sendable, Equatable {
+    let microphoneAWeightedDBFS: Double
+    let stabilityDB: Double
+    let noiseFloorDBFS: Double
+    let snrDB: Double
+}
+
 struct RelativeValidationResult: Sendable, Equatable {
     let systemVolume: Float
     let predictedRelativeDB: Double
@@ -73,21 +80,30 @@ enum CalibrationMeasurementError: LocalizedError {
     case insufficientSNR(frequency: Double, snr: Double)
     case unstable(frequency: Double, stability: Double)
     case volumeCurveInconsistent(volume: Float, dropDB: Double)
+    case acousticReferenceSNR(Double)
 
     var errorDescription: String? {
         switch self {
         case .outputDeviceChanged: "输出设备在校准过程中发生变化，测试已停止"
         case .inputDeviceChanged: "校准麦克风已断开或发生变化，测试已停止"
         case .inputChainChanged: "麦克风输入链在校准过程中发生变化，本次校准已停止，请重新开始。"
-        case .volumeUnavailable(let volume): "请把系统音量调到 \(Int(volume * 100))% 后重试"
-        case .noMeasurement(let frequency): "\(Int(frequency)) Hz 没有获得足够的麦克风数据"
-        case .clipping(let frequency): "\(Int(frequency)) Hz 测量时麦克风输入接近削波"
+        case .volumeUnavailable(let volume): "请把系统音量调到 \(CalibrationMeasurementEngine.percentText(volume)) 后重试"
+        case .noMeasurement(let frequency):
+            frequency > 0 ? "\(Int(frequency)) Hz 没有获得足够的麦克风数据" : "没有获得足够的麦克风数据"
+        case .clipping(let frequency):
+            frequency > 0
+                ? "\(Int(frequency)) Hz 测量时麦克风输入接近削波"
+                : "麦克风输入接近削波：把 EM258 和手机离扬声器远一点后重测"
+        case .acousticReferenceSNR(let snr):
+            "粉红噪声比环境底噪只高 \(String(format: "%.1f", snr)) dB（需要 ≥15 dB）。请让 EM258 和手机离扬声器近一些（30 cm 左右），并保持环境安静后重测。"
         case .insufficientSNR(let frequency, let snr):
             "\(Int(frequency)) Hz 信噪比不足（\(String(format: "%.1f", snr)) dB）。已自动提高到封顶电平重试；仍不足时请重点检查：① 环境噪声——关闭风扇/空调/其它播放（开放式耳罩双向透声，噪声最容易混入低频测量）；② 探头位置——EM258 尽量贴近耳机单元中心并保持稳定（开放式大耳低频对探头位置敏感）；③ 保持耳机和探头不动后点击「仅重测当前阶段」"
         case .unstable(let frequency, let stability):
-            "\(Int(frequency)) Hz 测量不稳定（\(String(format: "%.2f", stability)) dB）"
+            frequency > 0
+                ? "\(Int(frequency)) Hz 测量不稳定（\(String(format: "%.2f", stability)) dB）"
+                : "粉红噪声测量不稳定（\(String(format: "%.2f", stability)) dB）：请保持手机、EM258 不动，周围安静后重测"
         case .volumeCurveInconsistent(let volume, let dropDB):
-            "\(Int(volume * 100))% 音量点的麦克风读数比上一档低了约 \(String(format: "%.1f", dropDB)) dB，物理上不可能（该点可能没有真正以目标音量播放）。请确认：① 被测设备上的系统音量确实依次为 30% → 50% → 70%（不要用遥控器/其它软件误调）；② 耳机与 EM258 位置没有移动；③ 然后重测当前阶段。"
+            "\(CalibrationMeasurementEngine.percentText(volume)) 音量点的麦克风读数比上一档低了约 \(String(format: "%.1f", dropDB)) dB，物理上不可能（该点可能没有真正以目标音量播放）。请确认：① 测试期间没有用键盘/遥控器/其它软件改动系统音量；② 耳机与 EM258 位置没有移动；③ 然后重测当前阶段。"
         }
     }
 }
@@ -201,6 +217,7 @@ final class CalibrationMeasurementEngine {
         outputDeviceUID: String,
         testSignalRMSDBFS: Double,
         maxSignalAtVolume: ((Float) -> Double?)? = nil,
+        comfortableSignalAtVolume: ((Float) -> Double?)? = nil,
         progress: @escaping ProgressHandler
     ) async throws -> VolumeSweepResult {
         let originalVolume = outputMonitor.snapshot().volumeScalar
@@ -217,21 +234,25 @@ final class CalibrationMeasurementEngine {
             signalRMSDBFS: Double
         )] = []
         var currentLevel = testSignalRMSDBFS
-        for (index, volume) in CalibrationProfile.requiredVolumes.enumerated() {
+        let volumes = CalibrationProfile.requiredVolumes
+        for (index, volume) in volumes.enumerated() {
             try Task.checkCancellation()
             try verifyDevices(outputDeviceUID: outputDeviceUID)
+            let fraction = Double(index) / Double(volumes.count)
             progress(CalibrationProgress(
-                message: "正在设置系统音量到 \(Int(volume * 100))%",
-                fraction: Double(index) / 3,
+                message: "正在设置系统音量到 \(Self.percentText(volume))",
+                fraction: fraction,
                 retry: 0
             ))
             try await setOrAwaitVolume(volume, outputDeviceUID: outputDeviceUID, progress: progress)
+            // 高音量点先用较轻的测试音（约 80 dB），信噪比不够时再按封顶电平重测。
+            let initialLevel = min(currentLevel, comfortableSignalAtVolume?(volume) ?? currentLevel)
             let result = try await measureWithRetries(
                 frequencyHz: 1_000,
-                initialRMSDBFS: currentLevel,
+                initialRMSDBFS: initialLevel,
                 maxSignalRMSDBFS: maxSignalAtVolume?(volume),
                 outputDeviceUID: outputDeviceUID,
-                baseFraction: Double(index) / 3,
+                baseFraction: fraction,
                 progress: progress
             )
             currentLevel = min(currentLevel, result.usedSignalRMSDBFS)
@@ -274,7 +295,11 @@ final class CalibrationMeasurementEngine {
                 signalRMSDBFS: item.signalRMSDBFS
             )
         }
-        progress(CalibrationProgress(message: "3 个系统音量点测量完成", fraction: 1, retry: 0))
+        progress(CalibrationProgress(
+            message: "\(volumes.count) 个系统音量点测量完成",
+            fraction: 1,
+            retry: 0
+        ))
         return VolumeSweepResult(
             points: points,
             minimumSNRDB: measurements.map(\.measurement.snrDB).min() ?? 0,
@@ -331,6 +356,93 @@ final class CalibrationMeasurementEngine {
             measuredRelativeDB: measured,
             absoluteErrorDB: error
         )
+    }
+
+    /// 手机对标：内置扬声器放粉红噪声，测 EM258 的 A 计权电平。用户同时读手机。
+    /// 输入链（设备、采样率、增益）必须与戴耳机测量时一致，换算常数才成立。
+    func measureAcousticReference(
+        noisePlayer: CalibrationNoisePlayer,
+        progress: @escaping ProgressHandler
+    ) async throws -> AcousticReferenceMeasurement {
+        isRunning = true
+        defer {
+            noisePlayer.stop()
+            isRunning = false
+        }
+        try verifyInputChain()
+        progress(CalibrationProgress(message: "正在测量环境底噪（请保持安静）", fraction: 0.05, retry: 0))
+        microphone.beginBroadbandMeasurement()
+        try await waitWhileVerifyingInput(milliseconds: 2_500)
+        guard let noise = microphone.finishBroadbandMeasurement() else {
+            throw CalibrationMeasurementError.noMeasurement(0)
+        }
+
+        try noisePlayer.start()
+        progress(CalibrationProgress(
+            message: "正在播放粉红噪声：现在看手机读数，等它稳定后记下",
+            fraction: 0.15,
+            retry: 0
+        ))
+        try await waitWhileVerifyingInput(milliseconds: 2_000)
+        var levels: [Double] = []
+        var peak = -96.0
+        for window in 0..<4 {
+            microphone.beginBroadbandMeasurement()
+            try await waitWhileVerifyingInput(milliseconds: 4_000)
+            guard let measurement = microphone.finishBroadbandMeasurement() else {
+                throw CalibrationMeasurementError.noMeasurement(0)
+            }
+            levels.append(measurement.aWeightedDBFS)
+            peak = max(peak, measurement.peakDBFS)
+            progress(CalibrationProgress(
+                message: "正在播放粉红噪声：现在看手机读数，等它稳定后记下",
+                fraction: 0.15 + 0.8 * Double(window + 1) / 4,
+                retry: 0
+            ))
+        }
+        noisePlayer.stop()
+
+        let meanPower = levels.reduce(0) { $0 + pow(10, $1 / 10) } / Double(levels.count)
+        let level = 10 * log10(meanPower)
+        let stability = CalibrationFrequencyAnalyzer.standardDeviation(levels)
+        let snr = level - noise.aWeightedDBFS
+        if peak > -3 { throw CalibrationMeasurementError.clipping(0) }
+        if snr < 15 { throw CalibrationMeasurementError.acousticReferenceSNR(snr) }
+        if stability > 0.5 { throw CalibrationMeasurementError.unstable(frequency: 0, stability: stability) }
+        progress(CalibrationProgress(message: "测量完成，请输入手机读数", fraction: 1, retry: 0))
+        return AcousticReferenceMeasurement(
+            microphoneAWeightedDBFS: level,
+            stabilityDB: stability,
+            noiseFloorDBFS: noise.aWeightedDBFS,
+            snrDB: snr
+        )
+    }
+
+    private func verifyInputChain() throws {
+        guard microphone.verifySelectedDeviceIsPresent() else {
+            throw CalibrationMeasurementError.inputDeviceChanged
+        }
+        guard microphone.matchesCurrentInputChain() else {
+            throw CalibrationMeasurementError.inputChainChanged
+        }
+    }
+
+    private func waitWhileVerifyingInput(milliseconds: Int) async throws {
+        var remaining = milliseconds
+        while remaining > 0 {
+            try Task.checkCancellation()
+            try verifyInputChain()
+            let interval = min(500, remaining)
+            try await Task.sleep(for: .milliseconds(interval))
+            remaining -= interval
+        }
+    }
+
+    nonisolated static func percentText(_ volume: Float) -> String {
+        let percent = Double(volume) * 100
+        return percent == percent.rounded()
+            ? "\(Int(percent))%"
+            : String(format: "%.1f%%", percent)
     }
 
     private func measureWithRetries(
@@ -450,7 +562,7 @@ final class CalibrationMeasurementEngine {
         }
 
         progress(CalibrationProgress(
-            message: "请把系统音量调到 \(Int(target * 100))%，检测到后会自动继续",
+            message: "请把系统音量调到 \(Self.percentText(target))，检测到后会自动继续",
             fraction: 0,
             retry: 0
         ))

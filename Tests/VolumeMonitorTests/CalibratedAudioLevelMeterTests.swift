@@ -35,7 +35,7 @@ import Testing
         #expect(difference < 0.5, "\(frequencyHz) Hz differs by \(difference) dB")
     }
 
-    @Test func loudestChannelWinsInsteadOfStereoAverage() throws {
+    @Test func stereoChannelsAreEnergyAveraged() throws {
         var samples = stereoSine(
             frequencyHz: 1_000,
             frames: 48_000,
@@ -55,7 +55,8 @@ import Testing
                 )?.measure($0)?.rms
             }
         }
-        #expect(abs(try #require(rms) - 0.3535) < 0.02)
+        // L 0.5 峰值（均方 0.125）与 R 0.1 峰值（均方 0.005）按能量平均：√0.065 ≈ 0.255。
+        #expect(abs(try #require(rms) - 0.255) < 0.01)
     }
 
     @Test func threeDBHeadphoneResponseAddsThreeDBInPowerDomain() throws {

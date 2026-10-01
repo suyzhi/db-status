@@ -14,6 +14,7 @@ private final class PopoverCardView: NSView {
 @MainActor
 final class PopoverViewController: NSViewController {
     private let audioMonitor: SystemAudioLevelMonitor
+    private let appAttribution: AppAudioAttributionMonitor
     private let outputMonitor: OutputDeviceMonitor
     private let profiles: ProfileRepository
     private let exposure: ExposureService
@@ -22,6 +23,7 @@ final class PopoverViewController: NSViewController {
 
     var onShowSettings: (() -> Void)?
     var onShowCalibration: (() -> Void)?
+    var onShowWeeklySummary: (() -> Void)?
     var onQuit: (() -> Void)?
     var onMonitoringChanged: ((Bool) -> Void)?
 
@@ -45,6 +47,7 @@ final class PopoverViewController: NSViewController {
 
     init(
         audioMonitor: SystemAudioLevelMonitor,
+        appAttribution: AppAudioAttributionMonitor,
         outputMonitor: OutputDeviceMonitor,
         profiles: ProfileRepository,
         exposure: ExposureService,
@@ -52,6 +55,7 @@ final class PopoverViewController: NSViewController {
         calibrationStore: CalibrationStore
     ) {
         self.audioMonitor = audioMonitor
+        self.appAttribution = appAttribution
         self.outputMonitor = outputMonitor
         self.profiles = profiles
         self.exposure = exposure
@@ -90,31 +94,50 @@ final class PopoverViewController: NSViewController {
             headphoneProfileID: profile?.id,
             outputDeviceUID: device.uid
         )
-        let storedCalibration: CalibrationProfile?
-        if case .active(let calibration) = calibrationResolution,
-           calibration.frequencyCalibrationUsable {
-            storedCalibration = calibration
+        let activeCalibration: CalibrationProfile?
+        if case .active(let calibration) = calibrationResolution {
+            activeCalibration = calibration
         } else {
-            storedCalibration = nil
+            activeCalibration = nil
         }
-        audioMonitor.setCalibrationProfile(storedCalibration)
+        audioMonitor.setCalibrationProfile(
+            activeCalibration?.frequencyCalibrationUsable == true ? activeCalibration : nil
+        )
         let audio = audioMonitor.snapshot()
-        // A failed or not-yet-ready FFT must fall back as one complete chain,
-        // including the original volume model.
-        let runtimeCalibration = audio.frequencyCalibrationApplied ? storedCalibration : nil
+        // 音量曲线与绝对锚点不依赖 FFT 引擎：引擎没跑起来时仍用实测音量曲线，
+        // 只把频响加权换成保守补偿（宁可高估，不再整条链退回估算曲线）。
         let estimate = audio.hasUsableAudio ? LevelEstimator.estimate(
             volumeScalar: device.volumeScalar,
             isMuted: device.isMuted,
             rmsAWeightedDBFS: audio.rmsAWeightedDBFS,
             profile: profile,
-            calibrationProfile: runtimeCalibration,
-            frequencyCalibrationApplied: audio.frequencyCalibrationApplied
+            calibrationProfile: activeCalibration,
+            frequencyCalibrationApplied: audio.frequencyCalibrationApplied,
+            frequencyFallbackCompensationDB: fallbackCompensation(for: activeCalibration)
         ) : nil
         latestEstimate = estimate
 
+        // 声暴露按音频线程累加的真实能量积分；显示值（Fast 计权）只用于界面。
+        let loudness = audioMonitor.drainLoudness()
+        let levelFor: (Double) -> Double? = { meanSquare in
+            guard meanSquare > 0 else { return nil }
+            return LevelEstimator.estimate(
+                volumeScalar: device.volumeScalar,
+                isMuted: device.isMuted,
+                rmsAWeightedDBFS: Float(10 * log10(meanSquare)),
+                profile: profile,
+                calibrationProfile: activeCalibration,
+                frequencyCalibrationApplied: audio.frequencyCalibrationApplied,
+                frequencyFallbackCompensationDB: self.fallbackCompensation(for: activeCalibration)
+            ).map { Double($0.estimatedLevelDBA) }
+        }
         let summary = exposure.ingest(
-            levelDBA: preferences.monitoringEnabled ? estimate.map { Double($0.estimatedLevelDBA) } : nil,
-            deviceUID: device.uid
+            levelDBA: preferences.monitoringEnabled ? levelFor(loudness.meanSquare) : nil,
+            peakDBA: levelFor(loudness.maxFastMeanSquare),
+            duration: loudness.activeSeconds,
+            deviceUID: device.uid,
+            currentLevelDBA: estimate.map { Double($0.estimatedLevelDBA) },
+            appEnergy: appAttribution.drain()
         )
 
         updateDevice(device)
@@ -143,6 +166,18 @@ final class PopoverViewController: NSViewController {
     }
 
     private var lastDiagnosticDate = Date.distantPast
+    private var cachedFallbackCompensation: (id: UUID, value: Float)?
+
+    /// 每个校准档案只算一次（要扫一遍 A 加权频响）。
+    private func fallbackCompensation(for calibration: CalibrationProfile?) -> Float {
+        guard let calibration else { return 0 }
+        if let cached = cachedFallbackCompensation, cached.id == calibration.id {
+            return cached.value
+        }
+        let value = Float(calibration.frequencyFallbackCompensationDB)
+        cachedFallbackCompensation = (calibration.id, value)
+        return value
+    }
 
     /// 排查「数值不对」类问题时，把内部判断链写进诊断日志（仅 VM_DIAG=1 生效）。
     private func logEstimateDiagnostics(
@@ -200,6 +235,13 @@ final class PopoverViewController: NSViewController {
         menuButton = NSPopUpButton(frame: .zero, pullsDown: false)
         menuButton.addItem(withTitle: "更多")
         menuButton.menu?.addItem(.separator())
+        let summaryItem = NSMenuItem(
+            title: "每周小结…",
+            action: #selector(showWeeklySummary),
+            keyEquivalent: ""
+        )
+        summaryItem.target = self
+        menuButton.menu?.addItem(summaryItem)
         let calibrationItem = NSMenuItem(
             title: "校准…",
             action: #selector(showCalibration),
@@ -319,7 +361,15 @@ final class PopoverViewController: NSViewController {
         _ estimate: LevelEstimate,
         audio: AudioLevelSnapshot
     ) -> String {
-        if estimate.volumeCalibrationApplied { return "EM258 校准生效" }
+        if estimate.volumeCalibrationApplied {
+            let absolute = estimate.confidence == .measuredAbsolute ? "实测绝对值" : "规格绝对值"
+            if estimate.frequencyCalibrationApplied { return "EM258 校准生效 · \(absolute)" }
+            return String(
+                format: "频响校准未生效 · 已保守 +%.1f dB · %@",
+                estimate.frequencyFallbackCompensationDB,
+                absolute
+            )
+        }
         if estimate.frequencyCalibrationApplied { return "仅频响校准生效" }
         if let reason = audio.calibrationFallbackReason, !reason.isEmpty {
             return "模型估算 · \(reason)"
@@ -364,7 +414,8 @@ final class PopoverViewController: NSViewController {
             setTextColor(levelLabel, .labelColor)
             setText(levelLabel, String(format: "%.1f", estimate.estimatedLevelDBA))
             setText(confidenceLabel, "\(estimate.profileName) · \(Self.calibrationPathText(estimate, audio: audio))")
-            setTextColor(confidenceLabel, estimate.volumeCalibrationApplied ? .systemBlue : .systemOrange)
+            let fullyCalibrated = estimate.volumeCalibrationApplied && estimate.frequencyCalibrationApplied
+            setTextColor(confidenceLabel, fullyCalibrated ? .systemBlue : .systemOrange)
             setText(stateLabel, "实时估算")
             return
         }
@@ -449,6 +500,10 @@ final class PopoverViewController: NSViewController {
 
     @objc private func showSettings() {
         onShowSettings?()
+    }
+
+    @objc private func showWeeklySummary() {
+        onShowWeeklySummary?()
     }
 
     @objc private func showCalibration() {

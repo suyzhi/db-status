@@ -114,7 +114,7 @@ private func runLogicSelfTest() -> Int {
         isMuted: false,
         rmsAWeightedDBFS: 0,
         profile: profile
-    ), abs(estimate.estimatedLevelDBA - 106.0206) < 0.001 else {
+    ), abs(estimate.estimatedLevelDBA - 109.0309) < 0.001 else {
         print("logic-self-test: voltage formula failed")
         return 10
     }

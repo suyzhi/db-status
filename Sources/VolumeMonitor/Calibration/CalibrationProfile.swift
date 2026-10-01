@@ -101,6 +101,36 @@ struct MicrophoneResponseProfile: Codable, Sendable, Equatable {
     )
 }
 
+/// 用手机/声级计给 EM258 定刻度后得到的绝对声压锚点。
+struct AcousticReferenceCalibration: Codable, Sendable, Equatable {
+    /// 参考声级计（如 iPhone + NIOSH SLM）读数，dBA。
+    let referenceMeterDBA: Double
+    /// 同一时刻 EM258 的 A 计权 RMS 电平，dBFS。
+    let microphoneAWeightedDBFS: Double
+    let microphoneStabilityDB: Double
+    /// 参考设备说明，例如 "iPhone 15 Pro Max · NIOSH SLM"。
+    let referenceDescription: String
+    let measuredAt: Date
+    /// 参考音量下，数字 RMS 0 dBFS 的 1 kHz 信号在耳道口产生的声压（dB SPL）。
+    let fullScaleRMSSPLAtReferenceVolume: Double
+
+    /// EM258 dBFS → dB SPL 的换算常数。
+    var microphoneOffsetDB: Double { referenceMeterDBA - microphoneAWeightedDBFS }
+
+    var validationIssue: String? {
+        let values = [
+            referenceMeterDBA, microphoneAWeightedDBFS,
+            microphoneStabilityDB, fullScaleRMSSPLAtReferenceVolume
+        ]
+        guard values.allSatisfy(\.isFinite) else { return "绝对校准包含无效数值" }
+        guard (40...110).contains(referenceMeterDBA) else { return "参考声级计读数超出 40~110 dBA" }
+        guard (60...140).contains(fullScaleRMSSPLAtReferenceVolume) else {
+            return "实测满幅声压不在合理范围（60~140 dB）"
+        }
+        return nil
+    }
+}
+
 struct CalibrationQuality: Codable, Sendable, Equatable {
     var averageStabilityDB: Double
     var maximumStabilityDB: Double
@@ -153,9 +183,14 @@ enum CalibrationValidationPolicy {
 }
 
 struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
-    static let currentVersion = 1
+    /// v2：音量曲线覆盖 25%~100%，可选手机对标的绝对校准。v1 档案仍可读取使用。
+    static let currentVersion = 2
+    static let supportedVersions = 1...2
     static let requiredFrequenciesHz: [Double] = [63, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 12_000]
-    static let requiredVolumes: [Float] = [0.3, 0.5, 0.7]
+    /// 全量程音量点，覆盖到 100% 才能不依赖估算曲线换算绝对值。
+    static let requiredVolumes: [Float] = [0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+    /// v1 只测 30/50/70%，50% 的绝对值仍依赖估算曲线。
+    static let legacyVolumes: [Float] = [0.3, 0.5, 0.7]
 
     var version: Int
     var id: UUID
@@ -176,6 +211,7 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
     var absoluteCalibrationMode: AbsoluteCalibrationMode
     var microphoneResponse: MicrophoneResponseProfile
     var quality: CalibrationQuality
+    var acousticReference: AcousticReferenceCalibration?
 
     init(
         version: Int = CalibrationProfile.currentVersion,
@@ -196,7 +232,8 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
         volumeCalibrationValid: Bool = false,
         absoluteCalibrationMode: AbsoluteCalibrationMode = .estimatedFromHeadphoneModel,
         microphoneResponse: MicrophoneResponseProfile = .em258NominalUncorrected,
-        quality: CalibrationQuality = .unmeasured
+        quality: CalibrationQuality = .unmeasured,
+        acousticReference: AcousticReferenceCalibration? = nil
     ) {
         self.version = version
         self.id = id
@@ -217,6 +254,37 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
         self.absoluteCalibrationMode = absoluteCalibrationMode
         self.microphoneResponse = microphoneResponse
         self.quality = quality
+        self.acousticReference = acousticReference
+    }
+
+    var volumeCurveCoversFullScale: Bool {
+        volumeCalibrationUsable && volumePoints.contains { abs($0.systemVolume - 1) < 0.002 }
+    }
+
+    /// 实测频响（相对 1 kHz）。频响校准不可用时返回 nil。
+    func frequencyResponseDB(at frequencyHz: Double) -> Double? {
+        guard frequencyCalibrationUsable,
+              let response = FrequencyResponseInterpolator(points: frequencyPoints) else { return nil }
+        return response.responseDB(at: frequencyHz)
+    }
+
+    /// FFT 频响校准没跑起来时的保守补偿：按粉红噪声（每倍频程等能量）经 A 加权，
+    /// 实测频响相对"平直耳机"多出的能量。只取正值——回退时宁可高估。
+    var frequencyFallbackCompensationDB: Double {
+        guard frequencyCalibrationUsable,
+              let response = FrequencyResponseInterpolator(points: frequencyPoints) else { return 0 }
+        let aWeighting = AWeightingMeter(sampleRate: 48_000, channelCount: 1)
+        var flat = 0.0
+        var shaped = 0.0
+        var frequency = 31.5
+        while frequency <= 16_000 {
+            let weight = pow(10, aWeighting.frequencyResponseDB(at: frequency) / 10)
+            flat += weight
+            shaped += weight * pow(10, response.responseDB(at: frequency) / 10)
+            frequency *= pow(2, 1.0 / 6)
+        }
+        guard flat > 0, shaped > 0 else { return 0 }
+        return max(0, 10 * log10(shaped / flat))
     }
 
     var frequencyCalibrationUsable: Bool {
@@ -232,7 +300,7 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
     }
 
     var commonValidationIssue: String? {
-        guard version == Self.currentVersion else { return "不支持的校准版本 \(version)" }
+        guard Self.supportedVersions.contains(version) else { return "不支持的校准版本 \(version)" }
         guard !headphoneName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return "耳机名称为空"
         }
@@ -307,9 +375,16 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
             $0.measuredLevelDBFS?.isFinite != false
         }) else { return "音量校准包含无效数值" }
         let sorted = volumePoints.sorted { $0.systemVolume < $1.systemVolume }
-        guard sorted.count == Self.requiredVolumes.count else { return "音量点数量不完整" }
-        for (actual, expected) in zip(sorted.map(\.systemVolume), Self.requiredVolumes) {
-            guard abs(actual - expected) < 0.002 else { return "缺少 \(Int(expected * 100))% 音量点" }
+        guard zip(sorted, sorted.dropFirst()).allSatisfy({ $1.systemVolume - $0.systemVolume >= 0.002 }) else {
+            return "音量点重复"
+        }
+        // 覆盖到 100% 的按全量程要求；否则按 v1 的 30/50/70% 要求。允许额外的音量点。
+        let fullScale = sorted.contains { abs($0.systemVolume - 1) < 0.002 }
+        let required = fullScale ? Self.requiredVolumes : Self.legacyVolumes
+        for expected in required {
+            guard sorted.contains(where: { abs($0.systemVolume - expected) < 0.002 }) else {
+                return "缺少 \(Int((expected * 100).rounded()))% 音量点"
+            }
         }
         // 原始读数一致性：音量升高时麦克风电平不应大幅下降（测试音可能因削波
         // 回退几 dB，但 12 dB 以上的下跌说明该点未真正以目标音量播放）。
@@ -336,7 +411,19 @@ struct CalibrationProfile: Codable, Sendable, Equatable, Identifiable {
         return nil
     }
 
+    var absoluteValidationIssue: String? {
+        guard absoluteCalibrationMode == .acousticReference else { return nil }
+        guard let acousticReference else { return "缺少绝对校准数据" }
+        guard volumeCalibrationValid else { return "绝对校准需要有效的音量曲线" }
+        return acousticReference.validationIssue
+    }
+
     var validationIssues: [String] {
-        [commonValidationIssue, frequencyValidationIssue, volumeValidationIssue].compactMap { $0 }
+        [
+            commonValidationIssue,
+            frequencyValidationIssue,
+            volumeValidationIssue,
+            absoluteValidationIssue
+        ].compactMap { $0 }
     }
 }

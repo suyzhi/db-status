@@ -68,6 +68,14 @@ struct CalibrationFrequencyMeasurement: Sendable, Equatable {
     var isClipping: Bool { peakDBFS > -3 }
 }
 
+struct CalibrationBroadbandMeasurement: Sendable, Equatable {
+    let aWeightedDBFS: Double
+    let peakDBFS: Double
+    let durationSeconds: Double
+
+    var isClipping: Bool { peakDBFS > -3 }
+}
+
 struct CalibrationFrequencyWindowAnalysis: Sendable, Equatable {
     let levelDBFS: Double
     let stabilityDB: Double
@@ -320,6 +328,37 @@ final class CalibrationMicrophoneMonitor: ObservableObject {
             noiseFloorDBFS: noise,
             snrDB: analysis.levelDBFS - noise,
             sampleCount: analysis.sampleCount
+        )
+    }
+
+    /// 宽带测量（绝对校准用）：复用频点测量的样本缓冲，结束时按 A 加权计算。
+    func beginBroadbandMeasurement() {
+        beginFrequencyMeasurement(0)
+    }
+
+    func finishBroadbandMeasurement() -> CalibrationBroadbandMeasurement? {
+        captureState.sampleLock.lock()
+        let samplesByChannel = captureState.targetSamplesByChannel
+        let sampleRate = captureState.targetSampleRate
+        captureState.targetFrequencyHz = nil
+        captureState.targetSamplesByChannel.removeAll(keepingCapacity: true)
+        captureState.targetSampleRate = 0
+        captureState.sampleLock.unlock()
+
+        guard sampleRate > 0,
+              let longest = samplesByChannel.map(\.count).max(),
+              longest >= Int(sampleRate) else { return nil }
+        let meter = AWeightingMeter(sampleRate: sampleRate, channelCount: 1)
+        var strongest = 0.0
+        var peak = 0.0
+        for channel in samplesByChannel {
+            strongest = max(strongest, meter.rms(of: channel))
+            peak = max(peak, Double(channel.lazy.map { abs($0) }.max() ?? 0))
+        }
+        return CalibrationBroadbandMeasurement(
+            aWeightedDBFS: Self.dbFS(strongest),
+            peakDBFS: Self.dbFS(peak),
+            durationSeconds: Double(longest) / sampleRate
         )
     }
 

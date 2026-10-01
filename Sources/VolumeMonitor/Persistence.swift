@@ -8,6 +8,27 @@ private struct LegacyPersistedState: Codable {
     var exposureBuckets: [ExposureBucket] = []
 }
 
+/// 测量链路变更的标记（校准偏移、校准档案等）。历史数据不回溯修改，
+/// 用标记说明哪天起数值口径变了。
+struct ExposureAnnotation: Codable, Sendable, Equatable, Identifiable {
+    let id: UUID
+    let date: Date
+    let title: String
+    let detail: String
+
+    init(id: UUID = UUID(), date: Date = .now, title: String, detail: String) {
+        self.id = id
+        self.date = date
+        self.title = title
+        self.detail = detail
+    }
+}
+
+private struct AnnotationsFile: Codable {
+    var schemaVersion = 1
+    var annotations: [ExposureAnnotation] = []
+}
+
 /// v2 档案文件：内容小、变更少，整体原子重写即可。
 private struct ProfilesFile: Codable {
     var schemaVersion = 2
@@ -21,9 +42,11 @@ final class LocalDataStore {
     static let profilesFileName = "profiles-v2.json"
     static let bucketsFileName = "exposure-buckets-v2.ndjson"
     static let legacyFileName = "monitoring-data-v1.json"
+    static let annotationsFileName = "annotations-v1.json"
 
     private(set) var profiles: [TransducerProfile]
     private(set) var exposureBuckets: [ExposureBucket]
+    private(set) var annotations: [ExposureAnnotation] = []
     /// minute → exposureBuckets 下标。避免每分钟都做一次 O(n) 线性查找。
     private var bucketIndexByMinute: [Date: Int] = [:]
     /// 载入或迁移过程中的降级说明，供诊断使用。
@@ -32,6 +55,7 @@ final class LocalDataStore {
     private let profilesURL: URL?
     private let bucketsURL: URL?
     private let legacyURL: URL?
+    private let annotationsURL: URL?
 
     init(directoryURL: URL? = LocalDataStore.defaultDirectoryURL()) {
         let profilesURL = directoryURL?.appendingPathComponent(Self.profilesFileName)
@@ -40,6 +64,7 @@ final class LocalDataStore {
         self.profilesURL = profilesURL
         self.bucketsURL = bucketsURL
         self.legacyURL = legacyURL
+        annotationsURL = directoryURL?.appendingPathComponent(Self.annotationsFileName)
 
         let fileManager = FileManager.default
         let profilesExist = profilesURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
@@ -78,6 +103,12 @@ final class LocalDataStore {
 
         lastLoadWarning = warning
         rebuildBucketIndex()
+        if let annotationsURL,
+           let data = try? Data(contentsOf: annotationsURL) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            annotations = (try? decoder.decode(AnnotationsFile.self, from: data).annotations) ?? []
+        }
 
         if !profilesExist || !bucketsExist {
             migrateLegacyFilesIfNeeded(
@@ -97,6 +128,21 @@ final class LocalDataStore {
         try writeProfilesFile()
     }
 
+    func addAnnotation(_ annotation: ExposureAnnotation) throws {
+        annotations.append(annotation)
+        annotations.sort { $0.date < $1.date }
+        guard let annotationsURL else { return }
+        try FileManager.default.createDirectory(
+            at: annotationsURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(AnnotationsFile(annotations: annotations))
+            .write(to: annotationsURL, options: [.atomic])
+    }
+
     func removeProfile(deviceUID: String) throws {
         profiles.removeAll { $0.deviceUID == deviceUID }
         try writeProfilesFile()
@@ -105,10 +151,7 @@ final class LocalDataStore {
     /// 合并一个分钟桶：内存按下标 O(1) 合并，磁盘只追加一行。
     func merge(bucket: ExposureBucket) throws {
         if let index = bucketIndexByMinute[bucket.minute], index < exposureBuckets.count {
-            exposureBuckets[index].normalizedEnergyAt80Seconds += bucket.normalizedEnergyAt80Seconds
-            exposureBuckets[index].measuredDuration += bucket.measuredDuration
-            exposureBuckets[index].peakDBA = max(exposureBuckets[index].peakDBA, bucket.peakDBA)
-            exposureBuckets[index].deviceUID = bucket.deviceUID
+            exposureBuckets[index].absorb(bucket)
         } else {
             bucketIndexByMinute[bucket.minute] = exposureBuckets.count
             exposureBuckets.append(bucket)
@@ -241,10 +284,7 @@ final class LocalDataStore {
                 continue
             }
             if let index = indexByMinute[bucket.minute] {
-                buckets[index].normalizedEnergyAt80Seconds += bucket.normalizedEnergyAt80Seconds
-                buckets[index].measuredDuration += bucket.measuredDuration
-                buckets[index].peakDBA = max(buckets[index].peakDBA, bucket.peakDBA)
-                buckets[index].deviceUID = bucket.deviceUID
+                buckets[index].absorb(bucket)
             } else {
                 indexByMinute[bucket.minute] = buckets.count
                 buckets.append(bucket)
@@ -263,10 +303,7 @@ final class LocalDataStore {
         var indexByMinute: [Date: Int] = [:]
         for bucket in buckets {
             if let index = indexByMinute[bucket.minute] {
-                result[index].normalizedEnergyAt80Seconds += bucket.normalizedEnergyAt80Seconds
-                result[index].measuredDuration += bucket.measuredDuration
-                result[index].peakDBA = max(result[index].peakDBA, bucket.peakDBA)
-                result[index].deviceUID = bucket.deviceUID
+                result[index].absorb(bucket)
             } else {
                 indexByMinute[bucket.minute] = result.count
                 result.append(bucket)
@@ -291,6 +328,8 @@ final class ProfileRepository {
     init(store: LocalDataStore = .shared) {
         self.store = store
     }
+
+    var allProfiles: [TransducerProfile] { store.profiles }
 
     func profile(for deviceUID: String?) -> TransducerProfile? {
         guard let deviceUID else { return nil }
@@ -359,7 +398,6 @@ final class ExposureService {
     private let preferences: AppPreferences
     private var currentMinute: Date?
     private var pendingBucket: ExposureBucket?
-    private var lastIngestDate: Date?
     private var sessionEnergy = 0.0
     private var sessionDuration = 0.0
     private var sessionPeak: Double?
@@ -383,17 +421,29 @@ final class ExposureService {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    func ingest(levelDBA: Double?, deviceUID: String?, at date: Date = .now) -> ExposureSummary {
-        defer { lastIngestDate = date }
+    /// 累计一段有声时间的声暴露。
+    /// - levelDBA：这段时间的 LAeq（由音频线程累加的真实能量换算）
+    /// - peakDBA：这段时间的 LAFmax
+    /// - duration：有声时长，来自音频帧数而不是墙钟——主线程定时器被 App Nap
+    ///   或卡顿推迟时，能量也不会丢。
+    /// - currentLevelDBA：当前显示电平，只用于"剩余时间"估算。
+    func ingest(
+        levelDBA: Double?,
+        peakDBA: Double?,
+        duration: Double,
+        deviceUID: String?,
+        currentLevelDBA: Double?,
+        appEnergy: [String: Double] = [:],
+        at date: Date = .now
+    ) -> ExposureSummary {
         guard let levelDBA,
               levelDBA.isFinite,
               let deviceUID,
-              let lastIngestDate else {
-            return summary(currentLevel: levelDBA)
+              duration > 0 else {
+            return summary(currentLevel: currentLevelDBA)
         }
-
-        let duration = min(max(date.timeIntervalSince(lastIngestDate), 0), 2)
-        guard duration > 0 else { return summary(currentLevel: levelDBA) }
+        let duration = min(duration, 60)
+        let peak = peakDBA.flatMap { $0.isFinite ? max($0, levelDBA) : nil } ?? levelDBA
 
         let minute = Calendar.current.dateInterval(of: .minute, for: date)?.start ?? date
         if currentMinute != minute {
@@ -403,24 +453,33 @@ final class ExposureService {
                 minute: minute,
                 normalizedEnergyAt80Seconds: 0,
                 measuredDuration: 0,
-                peakDBA: levelDBA,
+                peakDBA: peak,
                 deviceUID: deviceUID
             )
         }
 
         let energy = ExposureMath.normalizedEnergyAt80(levelDBA: levelDBA, duration: duration)
         if var bucket = pendingBucket {
-            bucket.normalizedEnergyAt80Seconds += energy
-            bucket.measuredDuration += duration
-            bucket.peakDBA = max(bucket.peakDBA, levelDBA)
-            bucket.deviceUID = deviceUID
+            // App 份额只表示比例：把这段真实能量按比例分给各 App。
+            let attributedTotal = appEnergy.values.reduce(0) { $0 + max(0, $1) }
+            let attributed = attributedTotal > 0
+                ? appEnergy.compactMapValues { $0 > 0 ? energy * $0 / attributedTotal : nil }
+                : nil
+            bucket.absorb(ExposureBucket(
+                minute: minute,
+                normalizedEnergyAt80Seconds: energy,
+                measuredDuration: duration,
+                peakDBA: peak,
+                deviceUID: deviceUID,
+                appEnergy: attributed
+            ))
             pendingBucket = bucket
         }
         sessionEnergy += energy
         sessionDuration += duration
-        sessionPeak = max(sessionPeak ?? levelDBA, levelDBA)
+        sessionPeak = max(sessionPeak ?? peak, peak)
 
-        let result = summary(currentLevel: levelDBA, includePending: true)
+        let result = summary(currentLevel: currentLevelDBA, includePending: true)
         notifyIfNeeded(doseFraction: result.doseFraction)
         return result
     }

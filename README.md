@@ -14,7 +14,7 @@ macOS 菜单栏听力暴露估算工具。它通过 CoreAudio process tap 读取
 
 ## 声暴露
 
-默认使用 WHO 成人参考模式：`80 dBA × 40 小时/过去 7 天 = 100%`。设置中也可选择 `75 dBA × 40 小时`保守模式。数据按分钟聚合，仅保存在本机 `Application Support/VolumeMonitor` 中，保留 8 周。
+默认使用 WHO 成人参考模式：`80 dBA × 40 小时/过去 7 天 = 100%`。设置中也可选择 `75 dBA × 40 小时`保守模式。数据按分钟聚合，仅保存在本机 `Application Support/VolumeMonitor` 中：分钟明细保留 8 周，每周汇总永久保留。
 
 ## 构建和验证
 
@@ -37,6 +37,12 @@ swift run VolumeMonitor --self-test-logic
 > 需要更换 `Packaging/Info.plist` 中的 `CFBundleIdentifier`。当前版本已使用
 > `com.volumemonitor.app2`。
 
-## EM258 相对校准
+## EM258 校准
 
-弹窗中的“校准…”会打开独立的五步向导，使用外接 EM258 实测耳机相对频响和系统音量曲线。没有 94 dB 声学校准器时，绝对 SPL 仍明确使用耳机灵敏度与输出模型估算。校准、降级和配置格式详见 [METHODOLOGY.md](METHODOLOGY.md)。
+弹窗中的“校准…”会打开六步向导，使用外接 EM258 实测耳机相对频响和 25%~100% 系统音量曲线；最后一步可用 iPhone（NIOSH SLM）对标，得到耳道口的实测绝对声压（约 ±2 dB）。跳过对标时，绝对值按耳机灵敏度与最大输出换算。校准、降级和配置格式详见 [METHODOLOGY.md](METHODOLOGY.md)。
+
+## 其他
+
+- 声暴露按音频线程累加的真实能量积分；显示为 Fast（125 ms）计权。
+- “更多 → 每周小结…”：每周暴露、收听时长、最响的一天、按 App 的来源占比，永久保留。
+- 设置中可导出/导入全部设备档案与校准，换电脑无需重新校准。
