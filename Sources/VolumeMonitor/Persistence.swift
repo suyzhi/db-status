@@ -417,6 +417,7 @@ final class ExposureService {
     private var sessionDuration = 0.0
     private var sessionPeak: Double?
     private var cachedSevenDayEnergy = 0.0
+    private var sevenDayEnergyComputedAt = Date.distantPast
     private var lastNotifiedThreshold = 0.0
     private var lastPruneDate: Date?
 
@@ -455,6 +456,13 @@ final class ExposureService {
               levelDBA.isFinite,
               let deviceUID,
               duration > 0 else {
+            // 没有新读数（无声 / 暂停监测）时也要把已经过去的那一分钟写盘，
+            // 否则它会一直挂在 pendingBucket 里，被 summary 无限期计入。
+            let minute = Calendar.current.dateInterval(of: .minute, for: date)?.start ?? date
+            if let pendingBucket, pendingBucket.minute < minute {
+                flushPendingBucket()
+                currentMinute = nil
+            }
             return summary(currentLevel: currentLevelDBA)
         }
         let duration = min(duration, 60)
@@ -544,6 +552,7 @@ final class ExposureService {
     }
 
     private func summary(currentLevel: Double?, includePending: Bool = true) -> ExposureSummary {
+        reloadSevenDayEnergyIfStale()
         let pendingEnergy = includePending ? pendingBucket?.normalizedEnergyAt80Seconds ?? 0 : 0
         let dose = ExposureMath.doseFraction(
             normalizedEnergyAt80: cachedSevenDayEnergy + pendingEnergy,
@@ -586,6 +595,14 @@ final class ExposureService {
         cachedSevenDayEnergy = store.exposureBuckets
             .filter { $0.minute >= cutoff }
             .reduce(0) { $0 + $1.normalizedEnergyAt80Seconds }
+        sevenDayEnergyComputedAt = now
+    }
+
+    /// 7 天窗口随时间滑动：只在写入分钟桶后重算的话，长时间无声（不再写桶）时
+    /// 旧能量永远滑不出窗口，额度会一直停在高位。所以至少每分钟按当前时间重算一次。
+    private func reloadSevenDayEnergyIfStale(now: Date = .now) {
+        guard abs(now.timeIntervalSince(sevenDayEnergyComputedAt)) >= 60 else { return }
+        reloadSevenDayEnergy(now: now)
     }
 
     private func pruneOldBuckets(now: Date = .now) {
