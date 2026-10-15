@@ -2,6 +2,7 @@ import Accelerate
 import CoreAudio
 import Darwin
 import Foundation
+import os
 import VolumeMonitorAtomics
 
 struct AudioLevelSnapshot: Sendable {
@@ -88,12 +89,17 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
     private let lastSampleBits = vm_atomic_u64_create(0)!
     private let calibrationAppliedBits = vm_atomic_u32_create(0)!
 
-    // These resources are owned exclusively by captureQueue.
+    // Owned by captureQueue. aWeightingMeter, the integrator's audio-thread state
+    // and previousBlockWasSilent are also used by the IO proc, so captureQueue only
+    // mutates them before the IO proc is created or after it has been stopped.
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private var aWeightingMeter = AWeightingMeter(sampleRate: 48_000, channelCount: 2)
-    private var calibratedMeter: CalibratedAudioLevelMeter?
+    /// 校准引擎：captureQueue 写入（setCalibrationProfile 会在采集运行中替换），
+    /// CoreAudio 实时 IO 线程读取，因此必须经锁访问。IO 线程只 try-lock，从不阻塞。
+    /// 引擎本身不是 Sendable，所以用 *Unchecked 系列方法。
+    private let calibratedMeterLock = OSAllocatedUnfairLock<CalibratedAudioLevelMeter?>(uncheckedState: nil)
     private let integrator = LoudnessIntegrator()
     /// 仅音频回调使用：上一块是否为纯静音。
     private var previousBlockWasSilent = false
@@ -167,7 +173,7 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
             // 正确做法：sampleRate 在队列内现读；采集未就绪时保留请求，交给
             // configureCoreAudioTap 用 requestedCalibrationProfile 建引擎。
             guard let profile else {
-                calibratedMeter = nil
+                calibratedMeterLock.withLockUnchecked { $0 = nil }
                 stateLock.lock()
                 calibrationFallbackReason = nil
                 stateLock.unlock()
@@ -176,7 +182,7 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
                 return
             }
             guard profile.frequencyCalibrationUsable else {
-                calibratedMeter = nil
+                calibratedMeterLock.withLockUnchecked { $0 = nil }
                 stateLock.lock()
                 calibrationFallbackReason = "FFT 校准引擎无法启用"
                 stateLock.unlock()
@@ -199,7 +205,7 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
                 channelCount: channels,
                 frequencyPoints: profile.frequencyPoints
             ) else {
-                calibratedMeter = nil
+                calibratedMeterLock.withLockUnchecked { $0 = nil }
                 stateLock.lock()
                 calibrationFallbackReason = "FFT 校准引擎无法启用"
                 stateLock.unlock()
@@ -207,7 +213,7 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
                 AppDiagnostics.log("calib: engine init failed rate=\(currentSampleRate) ch=\(channels)")
                 return
             }
-            calibratedMeter = meter
+            calibratedMeterLock.withLockUnchecked { $0 = meter }
             stateLock.lock()
             calibrationFallbackReason = nil
             stateLock.unlock()
@@ -299,7 +305,7 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
         tapID = AudioObjectID(kAudioObjectUnknown)
         aWeightingMeter.reset()
-        calibratedMeter = nil
+        calibratedMeterLock.withLockUnchecked { $0 = nil }
         integrator.resetAudioThreadState()
         previousBlockWasSilent = false
         resetAtomicLevels()
@@ -370,12 +376,13 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         let calibrationProfile = requestedCalibrationProfile
         stateLock.unlock()
         if let calibrationProfile, calibrationProfile.frequencyCalibrationUsable {
-            calibratedMeter = CalibratedAudioLevelMeter(
+            let meter = CalibratedAudioLevelMeter(
                 sampleRate: streamFormat.mSampleRate,
                 channelCount: Int(streamFormat.mChannelsPerFrame),
                 frequencyPoints: calibrationProfile.frequencyPoints
             )
-            if calibratedMeter == nil {
+            calibratedMeterLock.withLockUnchecked { $0 = meter }
+            if meter == nil {
                 stateLock.lock()
                 calibrationFallbackReason = "FFT 校准引擎初始化失败"
                 stateLock.unlock()
@@ -445,6 +452,10 @@ final class SystemAudioLevelMonitor: NSObject, @unchecked Sendable {
         let sampleRate = aWeightingMeter.sampleRate
         let block = Self.blockPeakAndFrames(audioBufferList)
         guard block.frames > 0 else { return }
+        // 每个回调只在锁内取一次校准引擎（取出即持有引用，替换后旧引擎也不会被提前释放），
+        // 下面全部使用这个局部变量。拿不到锁（captureQueue 正在替换）时本块按未校准处理。
+        let calibratedMeter: CalibratedAudioLevelMeter? =
+            calibratedMeterLock.withLockIfAvailableUnchecked { $0 } ?? nil
 
         if block.peak == 0 {
             // 没有任何 App 出声时 tap 仍持续送零：跳过 IIR 与 FFT，只让 Fast 计权衰减。
