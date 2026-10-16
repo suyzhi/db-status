@@ -137,10 +137,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverWillShow(_ notification: Notification) {
         monitor.reloadDailyStats()
+        monitor.model.set(\.popoverShown, true)
         setRefreshInterval(Self.popoverRefreshInterval)
     }
 
-    func popoverDidClose(_ notification: Notification) {
+    /// 关闭动画一开始就停掉弹窗里的逐帧动画和 10 Hz 刷新：窗口淡出时系统不再取走画面，
+    /// 这时再重绘会让主线程每帧干等约 100 ms，关弹窗、从弹窗打开主窗口都会卡半秒多。
+    func popoverWillClose(_ notification: Notification) {
+        monitor.model.set(\.popoverShown, false)
         setRefreshInterval(Self.backgroundRefreshInterval)
     }
 
@@ -228,9 +232,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func showMainWindow(_ tab: MainTab) {
-        popover.performClose(nil)
+        closePopoverImmediately()
         makeMainWindowControllerIfNeeded()
         mainWindowController?.show(tab: tab)
+    }
+
+    /// 从弹窗跳到别的窗口时直接收起弹窗（像菜单项一样），不让淡出动画和新窗口的入场动画抢帧。
+    private func closePopoverImmediately() {
+        guard popover.isShown else { return }
+        popover.animates = false
+        popover.performClose(nil)
+        popover.animates = true
     }
 
     private func makeMainWindowControllerIfNeeded() {

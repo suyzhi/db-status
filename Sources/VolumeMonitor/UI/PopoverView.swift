@@ -52,7 +52,7 @@ struct PopoverView: View {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 7))
                     .foregroundStyle(model.isActive ? Theme.safe : Color.secondary)
-                    .symbolEffect(.pulse, options: .repeating, isActive: model.isActive && model.level != nil)
+                    .symbolEffect(.pulse, options: .repeating, isActive: model.popoverShown && model.isActive && model.level != nil)
                 Text(model.stateText)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -95,7 +95,7 @@ struct PopoverView: View {
                 }
                 .animation(.spring(response: 0.35, dampingFraction: 0.8), value: model.zone)
             }
-            Sparkline(samples: model.samples)
+            Sparkline(samples: model.samples, paused: !model.popoverShown)
                 .frame(height: 24)
             LevelMeter(level: model.level)
             if let notice = model.notice {

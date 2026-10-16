@@ -63,9 +63,10 @@ struct Sparkline: View {
     let samples: [LevelSample]
     var window: TimeInterval = 30
     var range: ClosedRange<Double> = 40...100
+    var paused = false
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: samples.isEmpty)) { context in
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: paused || samples.isEmpty)) { context in
             Canvas { graphics, size in
                 let now = context.date
                 var path = Path()

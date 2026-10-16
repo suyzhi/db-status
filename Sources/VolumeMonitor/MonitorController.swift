@@ -31,6 +31,8 @@ final class LiveMonitorModel: ObservableObject {
     @Published var days: [DailyExposureStat] = []
     @Published var samples: [LevelSample] = []
     @Published var monitoringEnabled = true
+    /// 弹窗正在显示（关闭动画开始即为 false）；不显示时弹窗里的持续动画全部暂停。
+    @Published var popoverShown = false
 
     var zone: LevelZone? { displayLevel.map(LevelZone.init(dBA:)) }
 
