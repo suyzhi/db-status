@@ -376,6 +376,11 @@ struct ExposureBucket: Codable, Sendable, Equatable, Identifiable {
     var deviceUID: String
     /// 按 App 分摊的能量（与 normalizedEnergyAt80Seconds 同单位）。缺失部分为未识别。
     var appEnergy: [String: Double]? = nil
+    /// 这一分钟有声时段内的系统音量范围（0~1）。用于事后核对"同音量读数不同"。
+    var volumeMin: Float? = nil
+    var volumeMax: Float? = nil
+    /// 其中经 FFT 频响校准引擎算出的秒数；与 measuredDuration 相差大说明校准没生效。
+    var calibratedSeconds: Double? = nil
 
     /// 合并同一分钟的另一条记录：能量/时长相加、峰值取大、App 能量逐项相加。
     mutating func absorb(_ other: ExposureBucket) {
@@ -383,6 +388,11 @@ struct ExposureBucket: Codable, Sendable, Equatable, Identifiable {
         measuredDuration += other.measuredDuration
         peakDBA = max(peakDBA, other.peakDBA)
         deviceUID = other.deviceUID
+        volumeMin = [volumeMin, other.volumeMin].compactMap { $0 }.min()
+        volumeMax = [volumeMax, other.volumeMax].compactMap { $0 }.max()
+        if let seconds = other.calibratedSeconds {
+            calibratedSeconds = (calibratedSeconds ?? 0) + seconds
+        }
         if let otherApps = other.appEnergy {
             var merged = appEnergy ?? [:]
             for (key, value) in otherApps { merged[key, default: 0] += value }

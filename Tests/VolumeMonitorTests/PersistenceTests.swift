@@ -64,6 +64,39 @@ import Testing
         #expect(reloaded.exposureBuckets[0].peakDBA == 90)
     }
 
+    @Test func bucketKeepsVolumeRangeAndCalibratedSeconds() throws {
+        let minute = Date(timeIntervalSince1970: 1_700_000_000)
+        var merged = ExposureBucket(
+            minute: minute, normalizedEnergyAt80Seconds: 0, measuredDuration: 0,
+            peakDBA: 70, deviceUID: "device"
+        )
+        merged.absorb(ExposureBucket(
+            minute: minute, normalizedEnergyAt80Seconds: 1, measuredDuration: 20, peakDBA: 70,
+            deviceUID: "device", volumeMin: 0.5, volumeMax: 0.5, calibratedSeconds: 20
+        ))
+        merged.absorb(ExposureBucket(
+            minute: minute, normalizedEnergyAt80Seconds: 1, measuredDuration: 10, peakDBA: 70,
+            deviceUID: "device", volumeMin: 0.3125, volumeMax: 0.3125, calibratedSeconds: 0
+        ))
+        #expect(merged.volumeMin == 0.3125)
+        #expect(merged.volumeMax == 0.5)
+        #expect(merged.calibratedSeconds == 20)
+
+        let (store, directory) = makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try store.merge(bucket: merged)
+        let reloaded = LocalDataStore(directoryURL: directory).exposureBuckets
+        #expect(reloaded.first?.volumeMax == 0.5)
+        #expect(reloaded.first?.calibratedSeconds == 20)
+    }
+
+    @Test func oldBucketLinesWithoutContextStillDecode() throws {
+        let line = #"{"deviceUID":"d","measuredDuration":60,"minute":813849960,"normalizedEnergyAt80Seconds":5,"peakDBA":76}"#
+        let bucket = try JSONDecoder().decode(ExposureBucket.self, from: Data(line.utf8))
+        #expect(bucket.volumeMin == nil)
+        #expect(bucket.calibratedSeconds == nil)
+    }
+
     @Test func outOfOrderMergeUpdatesTheIndexedBucket() throws {
         let (store, directory) = makeStore()
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -67,6 +67,8 @@ final class MonitorController {
 
     private var lastDiagnosticDate = Date.distantPast
     private var lastStatsDate = Date.distantPast
+    private var lastDeviceResyncDate = Date.distantPast
+    private static let deviceResyncInterval: TimeInterval = 5
     private var cachedFallbackCompensation: (id: UUID, value: Float)?
     private static let sparklineWindow: TimeInterval = 30
     /// 显示数字的更新周期，以及这段时间内实时声级的能量累加。
@@ -94,6 +96,11 @@ final class MonitorController {
     }
 
     func refresh(now: Date = .now) {
+        // 异步重读，结果在下一次刷新生效；最多比通知慢一个周期。
+        if now.timeIntervalSince(lastDeviceResyncDate) >= Self.deviceResyncInterval {
+            lastDeviceResyncDate = now
+            outputMonitor.resync()
+        }
         let device = outputMonitor.snapshot()
         let profile = profiles.profile(for: device.uid)
         let activeCalibration: CalibrationProfile?
@@ -138,7 +145,9 @@ final class MonitorController {
             duration: loudness.activeSeconds,
             deviceUID: device.uid,
             currentLevelDBA: current.map { Double($0.estimatedLevelDBA) },
-            appEnergy: appAttribution.drain()
+            appEnergy: appAttribution.drain(),
+            volumeScalar: device.volumeScalar,
+            frequencyCalibrationApplied: audio.frequencyCalibrationApplied
         )
 
         updateModel(

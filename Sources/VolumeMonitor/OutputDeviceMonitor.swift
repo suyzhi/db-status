@@ -68,6 +68,26 @@ final class OutputDeviceMonitor: @unchecked Sendable {
         listenerQueue.async { [weak self] in self?.refreshSnapshot() }
     }
 
+    /// 兜底：重读默认设备与音量。只靠属性通知时，漏掉一次（睡眠唤醒、插拔瞬间）
+    /// 就会一直按旧音量估算，常驻数周的进程尤其如此。
+    func resync() {
+        listenerQueue.async { [weak self] in
+            guard let self else { return }
+            lock.lock()
+            let started = isStarted
+            let before = currentSnapshot
+            lock.unlock()
+            guard started else { return }
+            refreshDefaultDeviceAndListeners()
+            let after = snapshot()
+            if after != before {
+                AppDiagnostics.log(
+                    "device: resync caught change uid=\(after.uid ?? "-") vol=\(before.volumeScalar.map { "\($0)" } ?? "-")→\(after.volumeScalar.map { "\($0)" } ?? "-")"
+                )
+            }
+        }
+    }
+
     func setVolumeScalar(_ value: Float) -> Bool {
         listenerQueue.sync {
             guard currentDeviceID != kAudioObjectUnknown else { return false }

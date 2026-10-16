@@ -450,6 +450,8 @@ final class ExposureService {
         deviceUID: String?,
         currentLevelDBA: Double?,
         appEnergy: [String: Double] = [:],
+        volumeScalar: Float? = nil,
+        frequencyCalibrationApplied: Bool? = nil,
         at date: Date = .now
     ) -> ExposureSummary {
         guard let levelDBA,
@@ -494,7 +496,10 @@ final class ExposureService {
                 measuredDuration: duration,
                 peakDBA: peak,
                 deviceUID: deviceUID,
-                appEnergy: attributed
+                appEnergy: attributed,
+                volumeMin: volumeScalar,
+                volumeMax: volumeScalar,
+                calibratedSeconds: frequencyCalibrationApplied.map { $0 ? duration : 0 }
             ))
             pendingBucket = bucket
         }
